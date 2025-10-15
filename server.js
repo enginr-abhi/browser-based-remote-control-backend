@@ -83,7 +83,7 @@ app.get("/download-agent", async (req, res) => {
 });
 
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
+  cors: { origin: "https://browser-based-remote-control-fronte.vercel.app/", methods: ["GET", "POST"] }
 });
 
 const peers = {}; // socketId -> { name, roomId, isAgent, isSharing, captureInfo? }
