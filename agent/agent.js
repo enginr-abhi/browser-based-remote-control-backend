@@ -46,7 +46,7 @@ try {
 }
 
 // ---- Socket ----
-const socket = io("http://localhost:9000", {
+const socket = io("https://browser-based-remote-control-backend.onrender.com", {
   transports: ["websocket"],
   reconnection: true,
   reconnectionAttempts: Infinity,
