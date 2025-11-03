@@ -42,7 +42,7 @@ try {
   console.warn("Failed to read config.json", e);
 }
 
-const SERVER = process.env.SERVER_URL || "http://localhost:9000";
+const SERVER = "https://browser-based-remote-control-backend.onrender.com" ;
 const socket = io(SERVER, { transports: ["websocket"], reconnection: true });
 
 let captureInfo = null;
