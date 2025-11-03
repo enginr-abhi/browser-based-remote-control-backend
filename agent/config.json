@@ -1,5 +1,5 @@
 {
   "roomId": "room1",
-  "server": "127.0.0.1",
-  "port": 3001
+  "server": "browser-based-remote-control-backend.onrender.com",
+  "port": 443
 }

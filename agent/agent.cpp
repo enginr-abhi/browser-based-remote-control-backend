@@ -1,6 +1,6 @@
-// agent.cpp  (Windows)
+// agent.cpp (Windows)
 // Compile: g++ agent.cpp -o agent.exe -Iinclude -lWs2_32 -lUser32
-// Requirements: include/json.hpp (nlohmann single header) in agent/include/json.hpp
+// Requires: include/json.hpp (nlohmann single header)
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -18,9 +18,20 @@
 using json = nlohmann::json;
 using namespace std;
 
-string SERVER_HOST = "127.0.0.1"; // change to deployed server domain when needed
-int SERVER_PORT = 3001;
+// ============================================================
+// 🧠 CHANGE THIS TO YOUR DEPLOYED BACKEND
+// ============================================================
+
+// ⚠️ IMPORTANT NOTE:
+// Render does NOT allow raw TCP on port 3001 over HTTPS.
+// So if your backend is on Render, use a VPS/Local for TCP server,
+// OR expose Render’s internal port 3001 through a proxy if needed.
+
+string SERVER_HOST = "browser-based-remote-control-backend.onrender.com";
+int SERVER_PORT = 3001; // keep 3001 — matches TCP server in server.js
 string ROOM = "room1";
+
+// ============================================================
 
 void loadConfig() {
     try {
@@ -147,8 +158,9 @@ int main() {
         return -1;
     }
 
+    cout << "🔗 Connecting to TCP server...\n";
     if (connect(sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
-        cerr << "Connection failed\n";
+        cerr << "❌ Connection failed (check if backend is running & TCP 3001 open)\n";
         closesocket(sock);
         freeaddrinfo(res);
         WSACleanup();
