@@ -1,105 +1,137 @@
-// ✅ FIXED server.js (Render compatible)
-const http = require('http');
+// ✅ FINAL SERVER — Supports Browser + C++ Agent
+// ==================================================
+
+const http = require("http");
 const express = require("express");
 const { Server } = require("socket.io");
 const cors = require("cors");
-const path = require('path');
+const path = require("path");
 const os = require("os");
+const fs = require("fs");
 const archiver = require("archiver");
-const fs = require('fs');
+const WebSocket = require("ws"); // for agent.exe
 
+// ====== CONFIG ======
 const PORT = process.env.PORT || 9000;
-const app = express();
-app.use(cors());
-app.use(express.json());
+const FRONTEND_ORIGIN = "https://browser-based-remote-control-fronte.vercel.app";
 
+// ====== EXPRESS + HTTP ======
+const app = express();
+app.use(cors({ origin: FRONTEND_ORIGIN }));
+app.use(express.json());
 const server = http.createServer(app);
+
+// ====== SOCKET.IO (Browser) ======
 const io = new Server(server, {
   cors: {
-    origin: "https://browser-based-remote-control-fronte.vercel.app",
-    methods: ["GET", "POST"]
-  }
+    origin: FRONTEND_ORIGIN,
+    methods: ["GET", "POST"],
+  },
 });
 
-// ---------------------- In-memory state ----------------------
-const peers = {};
-const users = {};
+// ====== STATE ======
+const peers = {}; // socket.id -> meta
+const users = {}; // socket.id -> { id, name, room, isOnline }
+const agentSockets = {}; // roomId -> ws connection (C++ agent)
 
-// simple user list broadcast
+// ====== HELPERS ======
 function broadcastUserList() {
   const list = Object.entries(users).map(([id, u]) => ({
     id,
     name: u.name || "Unknown",
     roomId: u.room || "N/A",
-    isOnline: !!u.isOnline
+    isOnline: !!u.isOnline,
   }));
   io.emit("peer-list", list);
 }
 
-// ✅ Root route for Render health check
+// ====== HEALTH CHECK ======
 app.get("/", (req, res) => {
-  res.send("✅ Backend is LIVE on Render!");
+  res.send("✅ Backend running with WebSocket Agent support");
 });
 
-// ✅ Download agent (bundle with room config)
+// ====== AGENT DOWNLOAD ======
 app.get("/download-agent", (req, res) => {
   const roomId = req.query.room || "room1";
   const agentExe = path.join(__dirname, "agent", "agent.exe");
-  if (!fs.existsSync(agentExe)) return res.status(404).send("Agent not found");
+  if (!fs.existsSync(agentExe)) return res.status(404).send("❌ Agent not found.");
 
   try {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-'));
-    const exePath = path.join(tmpDir, "remote-agent.exe");
-    fs.copyFileSync(agentExe, exePath);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-"));
+    const exeCopy = path.join(tmpDir, "remote-agent.exe");
+    fs.copyFileSync(agentExe, exeCopy);
     fs.writeFileSync(
       path.join(tmpDir, "config.json"),
       JSON.stringify({ roomId }, null, 2)
     );
 
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename=remote-agent-${roomId}.zip`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=remote-agent-${roomId}.zip`
+    );
+
     const archive = archiver("zip", { zlib: { level: 9 } });
     archive.pipe(res);
-    archive.file(exePath, { name: "agent.exe" });
+    archive.file(exeCopy, { name: "agent.exe" });
     archive.file(path.join(tmpDir, "config.json"), { name: "config.json" });
     archive.finalize();
   } catch (err) {
-    console.error("Error preparing agent:", err);
+    console.error("⚠️ Error preparing agent:", err);
     res.status(500).send("Error preparing agent");
   }
 });
 
-// ---------------------- SOCKET.IO HANDLERS ----------------------
+// ====== SOCKET.IO HANDLERS ======
 io.on("connection", (socket) => {
-  console.log("🔌 Connected:", socket.id);
+  console.log("🔌 Browser connected:", socket.id);
 
   socket.on("set-name", ({ name }) => {
     peers[socket.id] = { ...(peers[socket.id] || {}), name };
-    users[socket.id] = { id: socket.id, name, room: peers[socket.id]?.roomId || null, isOnline: true };
+    users[socket.id] = {
+      id: socket.id,
+      name,
+      room: peers[socket.id]?.roomId || null,
+      isOnline: true,
+    };
     broadcastUserList();
   });
 
-  socket.on("join-room", ({ roomId, name, isAgent = false }) => {
-    peers[socket.id] = { ...(peers[socket.id] || {}), name, roomId, isAgent, isSharing: false };
+  socket.on("join-room", ({ roomId, name }) => {
+    peers[socket.id] = { ...(peers[socket.id] || {}), name, roomId };
     socket.join(roomId);
     users[socket.id] = { id: socket.id, name, room: roomId, isOnline: true };
-
-    socket.to(roomId).emit("peer-joined", { id: socket.id, name, isAgent });
+    socket.to(roomId).emit("peer-joined", { id: socket.id, name });
     broadcastUserList();
-    console.log(`${name || 'Unknown'} joined room: ${roomId} (agent=${isAgent})`);
   });
 
-  socket.on("get-peers", () => broadcastUserList());
+  socket.on("request-screen", ({ roomId, from }) => {
+    socket.to(roomId).emit("screen-request", {
+      from,
+      name: peers[socket.id]?.name,
+    });
+  });
 
-  socket.on("leave-room", ({ roomId, name }) => {
-    const actualRoom = roomId || peers[socket.id]?.roomId;
-    if (actualRoom) {
-      socket.leave(actualRoom);
-      if (peers[socket.id]) peers[socket.id].roomId = null;
-      if (users[socket.id]) users[socket.id].isOnline = false;
-      socket.to(actualRoom).emit("peer-left", { id: socket.id, name });
-      broadcastUserList();
-      console.log(`${name || socket.id} left room: ${actualRoom}`);
+  socket.on("permission-response", ({ to, accepted }) => {
+    io.to(to).emit("permission-result", accepted);
+
+    if (accepted) {
+      const meta = peers[socket.id];
+      const roomId = meta?.roomId;
+      // Tell connected C++ agent to start streaming
+      const wsAgent = agentSockets[roomId];
+      if (wsAgent && wsAgent.readyState === WebSocket.OPEN) {
+        wsAgent.send(JSON.stringify({ action: "start-stream" }));
+      }
+    }
+  });
+
+  socket.on("control", (data) => {
+    const meta = peers[socket.id];
+    if (!meta?.roomId) return;
+    const wsAgent = agentSockets[meta.roomId];
+    if (wsAgent && wsAgent.readyState === WebSocket.OPEN) {
+      wsAgent.send(JSON.stringify({ action: "control", data }));
     }
   });
 
@@ -108,61 +140,52 @@ io.on("connection", (socket) => {
     delete peers[socket.id];
     delete users[socket.id];
     broadcastUserList();
-    if (meta.roomId) socket.to(meta.roomId).emit("peer-left", { id: socket.id });
-    console.log("❌ Disconnected:", socket.id);
-  });
-
-  // Controller requests screen access
-  socket.on("request-screen", ({ roomId, from }) => {
-    socket.to(roomId).emit("screen-request", { from, name: peers[socket.id]?.name });
-  });
-
-  // Permission granted/denied
-  socket.on("permission-response", ({ to, accepted }) => {
-    if (accepted && peers[socket.id]) peers[socket.id].isSharing = true;
-    io.to(to).emit("permission-result", accepted);
-
-    const meta = peers[socket.id];
-    if (accepted && meta?.roomId) {
-      for (const [id, p] of Object.entries(peers)) {
-        if (p.roomId === meta.roomId && p.isAgent) io.to(id).emit("start-stream", { roomId: meta.roomId });
-      }
-    }
-  });
-
-  socket.on("stop-share", ({ roomId, name }) => {
-    if (peers[socket.id]) peers[socket.id].isSharing = false;
-    io.in(roomId).emit("stop-share", { name });
-    for (const [id, p] of Object.entries(peers)) {
-      if (p.roomId === roomId && p.isAgent) io.to(id).emit("stop-stream", { roomId });
-    }
-  });
-
-  socket.on("signal", ({ roomId, desc, candidate }) => {
-    socket.to(roomId).emit("signal", { desc, candidate });
-  });
-
-  socket.on("capture-info", (info) => {
-    peers[socket.id] = { ...(peers[socket.id] || {}), captureInfo: info, roomId: info.roomId };
-    for (const [id, p] of Object.entries(peers)) {
-      if (p.roomId === info.roomId && p.isAgent) io.to(id).emit("capture-info", info);
-    }
-  });
-
-  socket.on("screen-frame", ({ roomId, agentId, image }) => {
-    if (roomId) socket.to(roomId).emit("screen-frame", { agentId, image });
-  });
-
-  socket.on("control", (data) => {
-    const { roomId } = peers[socket.id] || {};
-    if (!roomId) return;
-    for (const [id, p] of Object.entries(peers)) {
-      if (p.roomId === roomId && p.isAgent) io.to(id).emit("control", data);
-    }
+    console.log("❌ Browser disconnected:", socket.id);
   });
 });
 
-// ---------------------- Start HTTP server ----------------------
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
+// ====== WEBSOCKET SERVER for agent.exe ======
+const wss = new WebSocket.Server({ noServer: true });
+
+wss.on("connection", (ws, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const roomId = url.searchParams.get("room") || "room1";
+  agentSockets[roomId] = ws;
+  console.log(`🤖 Agent connected for room: ${roomId}`);
+
+  ws.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+      if (data.type === "frame") {
+        io.in(roomId).emit("screen-frame", {
+          agentId: "agent-" + roomId,
+          image: data.image,
+        });
+      }
+    } catch (err) {
+      console.error("Agent message error:", err);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log(`⚠️ Agent disconnected for room: ${roomId}`);
+    delete agentSockets[roomId];
+  });
+});
+
+// ====== UPGRADE HTTP -> WS ======
+server.on("upgrade", (req, socket, head) => {
+  if (req.url.startsWith("/ws-agent")) {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+// ====== START SERVER ======
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log("🌐 WebSocket endpoint ready at /ws-agent");
 });
