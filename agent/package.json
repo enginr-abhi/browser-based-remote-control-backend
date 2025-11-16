@@ -20,11 +20,18 @@
     "os": "^0.1.2",
     "process": "^0.11.10",
     "screenshot-desktop": "^1.15.3",
-    "socket.io-client": "^4.8.1"
+    "sharp": "^0.34.4",
+    "socket.io-client": "^4.8.1",
+    "uuid": "^13.0.0",
+    "ws": "^8.18.3"
   },
   "pkg": {
     "assets": [
-      "node_modules/@nut-tree-fork/libnut-win32/build/Release/*.node"
-    ]
+      "config.json",
+      "node_modules/@nut-tree-fork/libnut-win32/build/Release/*.node",
+      "node_modules/sharp/build/Release/*.node",
+      "node_modules/sharp/vendor/lib/*"
+    ],
+    "scripts": []
   }
 }

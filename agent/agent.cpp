@@ -1,592 +1,437 @@
-// agent.cpp — Robust Windows WSS agent (final)
-// Build: cl /EHsc agent.cpp /link winhttp.lib ws2_32.lib user32.lib gdiplus.lib
-// Requires nlohmann/json.hpp (https://github.com/nlohmann/json)
+// agent.cpp
+// Compile:
+// cl /EHsc agent.cpp /link winhttp.lib gdiplus.lib user32.lib gdi32.lib ole32.lib
+//
+// Requires Windows (WinHTTP, GDI+, SendInput). Place a config.json next to exe.
+//
+// Basic socket.io (engine.io v4) minimal implementation over WebSocket (WinHTTP).
+// Sends "set-name" and "join-room" (isAgent=true), captures screen to JPEG and
+// sends as binary attachment for event "frame". Handles "grant-control" and "control" events.
 
-#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <winhttp.h>
 #include <gdiplus.h>
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "gdiplus.lib")
-
 #include <iostream>
-#include <fstream>
-#include <string>
 #include <vector>
+#include <string>
 #include <thread>
+#include <atomic>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 #include <chrono>
 #include <mutex>
-#include <atomic>
-#include <sstream>
-#include <algorithm>
+#include <nlohmann/json.hpp> // include nlohmann/json.hpp in include path
 
-#include "json.hpp"
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "gdiplus.lib")
+
 using json = nlohmann::json;
 using namespace Gdiplus;
-using namespace std;
 
-// ---------- Config & State ----------
-static std::atomic<bool> keepRunning{ true };
-static std::atomic<bool> connected{ false };
-static std::mutex sendMutex;
+std::string configServer = "https://browser-based-remote-control-backend.onrender.com";
+std::string configRoom = "room1";
+std::string configName = "agent-pc";
+int configFps = 5;
+bool sendCursor = true;
 
-static HINTERNET hSession = NULL;
-static HINTERNET hConnect = NULL;
-static HINTERNET hWebSocket = NULL;
+std::atomic<bool> keepRunning(true);
+std::atomic<bool> granted(false);
+std::mutex sockMutex;
 
-std::string SERVER_HOST = "browser-based-remote-control-backend.onrender.com";
-int SERVER_PORT = 443;
-std::string ROOM = "room1";
-std::string AGENT_ID = "agent-cpp-001";
-int FRAME_MS = 250; // milliseconds (4 FPS default)
-int MAX_WIDTH = 1366; // downscale large screens to this width by default
-int JPEG_QUALITY = 60; // 0-100
+HINTERNET hSession = NULL;
+HINTERNET hConnect = NULL;
+HINTERNET hRequest = NULL;
+HINTERNET hWebSocket = NULL;
 
-// ---------- Utilities ----------
-static inline std::wstring utf8_to_wstring(const std::string& s) {
-    if (s.empty()) return std::wstring();
-    int sz = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), NULL, 0);
-    std::wstring w; w.resize(sz);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], sz);
-    return w;
-}
-static inline std::string wstring_to_utf8(const std::wstring& w) {
-    if (w.empty()) return std::string();
-    int sz = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), NULL, 0, NULL, NULL);
-    std::string s; s.resize(sz);
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], sz, NULL, NULL);
-    return s;
-}
-
-// base64 table
-static const char* b64_table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-std::string base64_encode(const unsigned char* data, size_t len) {
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    size_t i = 0;
-    while (i + 2 < len) {
-        unsigned int val = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
-        out.push_back(b64_table[(val >> 18) & 0x3F]);
-        out.push_back(b64_table[(val >> 12) & 0x3F]);
-        out.push_back(b64_table[(val >> 6) & 0x3F]);
-        out.push_back(b64_table[val & 0x3F]);
-        i += 3;
+// Utility: read config.json
+void loadConfig() {
+    std::ifstream f("config.json");
+    if (!f.is_open()) return;
+    try {
+        json j; f >> j;
+        if (j.contains("server")) configServer = j["server"].get<std::string>();
+        if (j.contains("roomId")) configRoom = j["roomId"].get<std::string>();
+        if (j.contains("name")) configName = j["name"].get<std::string>();
+        if (j.contains("fps")) configFps = j["fps"].get<int>();
+        if (j.contains("sendCursor")) sendCursor = j["sendCursor"].get<bool>();
+    } catch (...) {
+        std::cout << "Failed parsing config.json\n";
     }
-    if (i < len) {
-        unsigned int val = (data[i] << 16);
-        if ((i + 1) < len) val |= (data[i + 1] << 8);
-        out.push_back(b64_table[(val >> 18) & 0x3F]);
-        out.push_back(b64_table[(val >> 12) & 0x3F]);
-        if ((i + 1) < len) {
-            out.push_back(b64_table[(val >> 6) & 0x3F]);
-            out.push_back('=');
-        } else {
-            out.push_back('=');
-            out.push_back('=');
-        }
-    }
-    return out;
 }
 
-// ---------- GDI+ helpers (capture & encode JPEG) ----------
-bool GetEncoderClsid(const WCHAR* mime, CLSID* pClsid) {
-    UINT num = 0, size = 0;
-    if (GetImageEncodersSize(&num, &size) != Ok || size == 0) return false;
-    std::vector<BYTE> buffer(size);
-    ImageCodecInfo* pInfo = reinterpret_cast<ImageCodecInfo*>(buffer.data());
-    if (GetImageEncoders(num, size, pInfo) != Ok) return false;
-    for (UINT i = 0; i < num; ++i) {
-        if (wcscmp(pInfo[i].MimeType, mime) == 0) {
-            *pClsid = pInfo[i].Clsid;
-            return true;
-        }
-    }
-    return false;
+// Helper: parse host and path from server URL
+bool parseUrl(const std::string& url, std::wstring& hostOut, std::wstring& pathOut, INTERNET_PORT& portOut, bool& secure) {
+    // supports https://host[:port]/path
+    std::string u = url;
+    secure = false;
+    if (u.rfind("https://",0) == 0) { secure = true; u = u.substr(8); portOut = INTERNET_DEFAULT_HTTPS_PORT; }
+    else if (u.rfind("http://",0) == 0) { secure = false; u = u.substr(7); portOut = INTERNET_DEFAULT_HTTP_PORT; }
+    else { return false; }
+    size_t slash = u.find('/');
+    std::string host = (slash == std::string::npos) ? u : u.substr(0, slash);
+    std::string path = (slash == std::string::npos) ? std::string("/") : u.substr(slash);
+    // remove trailing /
+    hostOut = std::wstring(host.begin(), host.end());
+    pathOut = std::wstring(path.begin(), path.end());
+    return true;
 }
 
-// Resize GDI+ Bitmap to target width (maintain aspect)
-Bitmap* ResizeBitmap(Bitmap* src, UINT targetW) {
-    if (!src) return nullptr;
-    UINT w = src->GetWidth();
-    UINT h = src->GetHeight();
-    if (w <= targetW) return src; // no resize needed; caller must free or handle
-    double ratio = (double)targetW / (double)w;
-    UINT newW = targetW;
-    UINT newH = (UINT)max(1.0, floor(h * ratio));
-    Bitmap* dst = new Bitmap(newW, newH, PixelFormat24bppRGB);
-    Graphics g(dst);
-    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-    g.DrawImage(src, 0, 0, newW, newH);
-    return dst;
+// Send text websocket frame (WinHTTP) - wrapper
+bool wsSendText(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(sockMutex);
+    if (!hWebSocket) return false;
+    BOOL ok = WinHttpWebSocketSend(hWebSocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (LPVOID)msg.c_str(), (DWORD)msg.size());
+    return ok == TRUE;
 }
 
-// Capture primary screen and return JPEG base64 (smaller than PNG)
-bool CaptureScreenToJpegBase64(std::string& outBase64, int& outW, int& outH) {
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-    outW = screenW; outH = screenH;
+// Send binary websocket frame
+bool wsSendBinary(const std::vector<unsigned char>& data) {
+    std::lock_guard<std::mutex> lk(sockMutex);
+    if (!hWebSocket) return false;
+    BOOL ok = WinHttpWebSocketSend(hWebSocket, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, (LPVOID)data.data(), (DWORD)data.size());
+    return ok == TRUE;
+}
 
+// GDI+ capture to JPEG in memory
+std::vector<unsigned char> captureScreenJpeg(int& outW, int& outH, ULONG quality = 60) {
+    std::vector<unsigned char> out;
     HDC hScreenDC = GetDC(NULL);
-    if (!hScreenDC) return false;
+    int width = GetSystemMetrics(SM_CXSCREEN);
+    int height = GetSystemMetrics(SM_CYSCREEN);
+    outW = width; outH = height;
+
     HDC hMemDC = CreateCompatibleDC(hScreenDC);
-    if (!hMemDC) { ReleaseDC(NULL, hScreenDC); return false; }
-    HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, screenW, screenH);
-    if (!hBitmap) { DeleteDC(hMemDC); ReleaseDC(NULL, hScreenDC); return false; }
-    HGDIOBJ oldObj = SelectObject(hMemDC, hBitmap);
+    HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
+    HGDIOBJ oldBmp = SelectObject(hMemDC, hBitmap);
+    BitBlt(hMemDC, 0, 0, width, height, hScreenDC, 0, 0, SRCCOPY | CAPTUREBLT);
+    SelectObject(hMemDC, oldBmp);
 
-    bool captureOk = BitBlt(hMemDC, 0, 0, screenW, screenH, hScreenDC, 0, 0, SRCCOPY | CAPTUREBLT) != 0;
-
-    Bitmap* bmp = nullptr;
-    if (captureOk) {
-        bmp = new Bitmap(hBitmap, NULL);
-    } else {
-        SelectObject(hMemDC, oldObj);
-        DeleteObject(hBitmap);
-        DeleteDC(hMemDC);
-        ReleaseDC(NULL, hScreenDC);
-        return false;
+    // GDI+ Bitmap from HBITMAP
+    Bitmap bmp(hBitmap, NULL);
+    // Save to IStream
+    IStream* istream = NULL;
+    if (CreateStreamOnHGlobal(NULL, TRUE, &istream) == S_OK) {
+        CLSID clsidEncoder;
+        // find jpeg CLSID
+        UINT num = 0, size = 0;
+        GetImageEncodersSize(&num, &size);
+        if (size > 0) {
+            ImageCodecInfo* pImageCodecInfo = (ImageCodecInfo*)(malloc(size));
+            if (pImageCodecInfo) {
+                GetImageEncoders(num, size, pImageCodecInfo);
+                for (UINT j = 0; j < num; ++j) {
+                    if (wcscmp(pImageCodecInfo[j].MimeType, L"image/jpeg") == 0) {
+                        clsidEncoder = pImageCodecInfo[j].Clsid;
+                        break;
+                    }
+                }
+                free(pImageCodecInfo);
+                // encoder parameters
+                EncoderParameters encoderParams;
+                encoderParams.Count = 1;
+                encoderParams.Parameter[0].Guid = EncoderQuality;
+                encoderParams.Parameter[0].Type = EncoderParameterValueTypeLong;
+                encoderParams.Parameter[0].NumberOfValues = 1;
+                encoderParams.Parameter[0].Value = &quality;
+                if (bmp.Save(istream, &clsidEncoder, &encoderParams) == Ok) {
+                    // read stream into buffer
+                    LARGE_INTEGER zero = {}; ULARGE_INTEGER size2 = {};
+                    IStream_GetSize(istream, &size2);
+                    // Rewind
+                    LARGE_INTEGER liZero; liZero.QuadPart = 0;
+                    istream->Seek(liZero, STREAM_SEEK_SET, NULL);
+                    // read
+                    STATSTG statstg;
+                    if (istream->Stat(&statstg, STATFLAG_NONAME) == S_OK) {
+                        ULONG toRead = (ULONG)statstg.cbSize.QuadPart;
+                        out.resize(toRead);
+                        ULONG actuallyRead = 0;
+                        istream->Read(out.data(), toRead, &actuallyRead);
+                        out.resize(actuallyRead);
+                    }
+                }
+            }
+        }
+        istream->Release();
     }
 
-    // optionally resize if very wide
-    Bitmap* toSave = nullptr;
-    if (screenW > (UINT)MAX_WIDTH) {
-        toSave = ResizeBitmap(bmp, (UINT)MAX_WIDTH);
-        outW = toSave ? (int)toSave->GetWidth() : outW;
-        outH = toSave ? (int)toSave->GetHeight() : outH;
-    } else {
-        toSave = bmp;
-    }
-
-    // Save to IStream as JPEG with given quality
-    IStream* pStream = nullptr;
-    if (CreateStreamOnHGlobal(NULL, TRUE, &pStream) != S_OK) {
-        if (toSave != bmp) delete toSave;
-        delete bmp;
-        SelectObject(hMemDC, oldObj);
-        DeleteObject(hBitmap);
-        DeleteDC(hMemDC);
-        ReleaseDC(NULL, hScreenDC);
-        return false;
-    }
-
-    CLSID jpgClsid;
-    if (!GetEncoderClsid(L"image/jpeg", &jpgClsid)) {
-        pStream->Release();
-        if (toSave != bmp) delete toSave;
-        delete bmp;
-        SelectObject(hMemDC, oldObj);
-        DeleteObject(hBitmap);
-        DeleteDC(hMemDC);
-        ReleaseDC(NULL, hScreenDC);
-        return false;
-    }
-
-    // set quality
-    EncoderParameters encParams;
-    encParams.Count = 1;
-    encParams.Parameter[0].Guid = EncoderQuality;
-    encParams.Parameter[0].Type = EncoderParameterValueTypeLong;
-    encParams.Parameter[0].NumberOfValues = 1;
-    ULONG quality = (ULONG)max(1, min(100, JPEG_QUALITY));
-    encParams.Parameter[0].Value = &quality;
-
-    Status s = toSave->Save(pStream, &jpgClsid, &encParams);
-    if (s != Ok) {
-        pStream->Release();
-        if (toSave != bmp) delete toSave;
-        delete bmp;
-        SelectObject(hMemDC, oldObj);
-        DeleteObject(hBitmap);
-        DeleteDC(hMemDC);
-        ReleaseDC(NULL, hScreenDC);
-        return false;
-    }
-
-    HGLOBAL hMem = NULL;
-    if (GetHGlobalFromStream(pStream, &hMem) != S_OK || !hMem) {
-        pStream->Release();
-        if (toSave != bmp) delete toSave;
-        delete bmp;
-        SelectObject(hMemDC, oldObj);
-        DeleteObject(hBitmap);
-        DeleteDC(hMemDC);
-        ReleaseDC(NULL, hScreenDC);
-        return false;
-    }
-
-    SIZE_T size = GlobalSize(hMem);
-    if (size == 0) {
-        pStream->Release();
-        if (toSave != bmp) delete toSave;
-        delete bmp;
-        SelectObject(hMemDC, oldObj);
-        DeleteObject(hBitmap);
-        DeleteDC(hMemDC);
-        ReleaseDC(NULL, hScreenDC);
-        return false;
-    }
-
-    void* pData = GlobalLock(hMem);
-    if (!pData) {
-        pStream->Release();
-        if (toSave != bmp) delete toSave;
-        delete bmp;
-        SelectObject(hMemDC, oldObj);
-        DeleteObject(hBitmap);
-        DeleteDC(hMemDC);
-        ReleaseDC(NULL, hScreenDC);
-        return false;
-    }
-
-    outBase64 = base64_encode((const unsigned char*)pData, (size_t)size);
-
-    GlobalUnlock(hMem);
-    pStream->Release();
-
-    if (toSave != bmp) delete toSave;
-    delete bmp;
-
-    // cleanup GDI objects
-    SelectObject(hMemDC, oldObj);
+    // cleanup
     DeleteObject(hBitmap);
     DeleteDC(hMemDC);
     ReleaseDC(NULL, hScreenDC);
+    return out;
+}
 
+// Simple JSON escape for small usage (we'll rely on nlohmann to produce payloads)
+std::string jsonEmitText(const std::string& event, const json& payload) {
+    json arr = json::array();
+    arr.push_back(event);
+    if (payload.is_null()) arr.push_back(json::object());
+    else arr.push_back(payload);
+    std::string s = "42" + arr.dump();
+    return s;
+}
+
+// Send event with single binary attachment: text '42["frame", {"_placeholder":true,"num":0}]' then binary image
+bool sendFrameAsSocketIOBinary(const std::vector<unsigned char>& jpeg) {
+    // text frame describing event with placeholder for one binary attachment
+    json arr = json::array();
+    arr.push_back("frame");
+    json placeholder = { { "_placeholder", true }, { "num", 0 } };
+    arr.push_back(placeholder);
+    std::string text = "42" + arr.dump();
+    if (!wsSendText(text)) return false;
+    // then send binary payload as separate binary websocket message
+    if (!wsSendBinary(jpeg)) return false;
     return true;
 }
 
-// ---------- WinHTTP / WebSocket helpers ----------
-void closeWebSocketHandles() {
-    std::lock_guard<std::mutex> lk(sendMutex);
-    if (hWebSocket) {
-        // best-effort close
-        WinHttpWebSocketClose(hWebSocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
-        WinHttpCloseHandle(hWebSocket);
-        hWebSocket = NULL;
-    }
-    if (hConnect) {
-        WinHttpCloseHandle(hConnect);
-        hConnect = NULL;
-    }
-    if (hSession) {
-        WinHttpCloseHandle(hSession);
-        hSession = NULL;
-    }
-    connected.store(false);
-}
-
-bool sendJsonMessage(const std::string& msg) {
-    std::lock_guard<std::mutex> lk(sendMutex);
-    if (!hWebSocket) return false;
-    HRESULT hr = WinHttpWebSocketSend(hWebSocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-        (PVOID)msg.c_str(), (DWORD)msg.size());
-    return (hr == S_OK);
-}
-
-// handle incoming control packets (viewer -> agent)
-void handleControlMessage(const json& p) {
-    try {
-        std::string type = p.value("type", "");
-        if (type.empty()) {
-            // server may send under different key 'action' or payload structure
-            if (p.contains("action")) type = p.value("action", "");
-            // or nested data
-            if (type.empty() && p.contains("data") && p["data"].is_object()) {
-                type = p["data"].value("type", "");
-            }
-        }
-        if (type == "mousemove") {
-            double nx = p.value("x", p.value("nx", 0.0));
-            double ny = p.value("y", p.value("ny", 0.0));
-            int sw = GetSystemMetrics(SM_CXSCREEN);
-            int sh = GetSystemMetrics(SM_CYSCREEN);
-            int x = (int)round(nx * sw);
-            int y = (int)round(ny * sh);
-            SetCursorPos(x, y);
-        } else if (type == "click" || type == "mousedown" || type == "mouseup") {
-            int btn = p.value("button", 0);
-            DWORD downFlag = (btn == 2) ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_LEFTDOWN;
-            DWORD upFlag = (btn == 2) ? MOUSEEVENTF_RIGHTUP : MOUSEEVENTF_LEFTUP;
-            INPUT inp;
-            ZeroMemory(&inp, sizeof(inp));
-            inp.type = INPUT_MOUSE;
-            if (type == "click") {
-                inp.mi.dwFlags = downFlag;
-                SendInput(1, &inp, sizeof(INPUT));
-                Sleep(18);
-                inp.mi.dwFlags = upFlag;
-                SendInput(1, &inp, sizeof(INPUT));
-            } else if (type == "mousedown") {
-                inp.mi.dwFlags = downFlag;
-                SendInput(1, &inp, sizeof(INPUT));
-            } else {
-                inp.mi.dwFlags = upFlag;
-                SendInput(1, &inp, sizeof(INPUT));
-            }
-        } else if (type == "wheel") {
-            int delta = p.value("deltaY", 0);
-            INPUT i;
-            ZeroMemory(&i, sizeof(i));
-            i.type = INPUT_MOUSE;
-            i.mi.dwFlags = MOUSEEVENTF_WHEEL;
-            i.mi.mouseData = (DWORD)delta;
-            SendInput(1, &i, sizeof(INPUT));
-        } else if (type == "keydown" || type == "keyup") {
-            std::string key = p.value("key", "");
-            if (!key.empty()) {
-                SHORT scan = VkKeyScanA(key[0]);
-                if (scan != 0xFFFF) {
-                    INPUT k;
-                    ZeroMemory(&k, sizeof(k));
-                    k.type = INPUT_KEYBOARD;
-                    k.ki.wVk = (WORD)LOBYTE(scan);
-                    if (type == "keyup") k.ki.dwFlags = KEYEVENTF_KEYUP;
-                    SendInput(1, &k, sizeof(INPUT));
+// Handle inbound text messages from socket.io/engine.io
+void handleTextMessage(const std::string& msg) {
+    if (msg.size() == 0) return;
+    char t = msg[0];
+    if (t == '0') {
+        // open packet: msg = 0{...}
+        std::string jsonPart = msg.substr(1);
+        std::cout << "[engine.io open] " << jsonPart << "\n";
+        // after open, send '40' to connect socket.io namespace
+        wsSendText("40");
+        // emit set-name and join-room
+        json jn = { {"name", configName} };
+        wsSendText(jsonEmitText("set-name", jn));
+        json jr = { {"roomId", configRoom}, {"name", configName}, {"isAgent", true} };
+        wsSendText(jsonEmitText("join-room", jr));
+        std::cout << "Sent join-room\n";
+    } else if (t == '3') {
+        // pong or pong ack
+        // ignore
+    } else if (t == '2') {
+        // ping from server; reply with '3'
+        wsSendText("3");
+    } else if (t == '4') {
+        // Socket.IO message: starts with '4' then second char is engine packet type; usually '42' for event
+        if (msg.size() >= 2 && msg[1] == '2') {
+            std::string jsonPart = msg.substr(2);
+            try {
+                json arr = json::parse(jsonPart);
+                if (!arr.is_array() || arr.size() < 1) return;
+                std::string event = arr[0].get<std::string>();
+                json data = arr.size() >= 2 ? arr[1] : json();
+                std::cout << "[event] " << event << " -> " << data.dump() << "\n";
+                if (event == "grant-control") {
+                    // server tells agent to allow frames for viewer
+                    granted = true;
+                    std::cout << "Granted control to viewer: " << data.dump() << "\n";
+                } else if (event == "revoke-control") {
+                    granted = false;
+                    std::cout << "Revoke control\n";
+                } else if (event == "control") {
+                    // viewer control event: move/click/keyboard
+                    // data may contain type, x,y,button, captureWidth/captureHeight
+                    std::string typ = data.value("type", "");
+                    if (typ == "mousemove") {
+                        double rx = data.value("x", 0.0);
+                        double ry = data.value("y", 0.0);
+                        int screenW = GetSystemMetrics(SM_CXSCREEN);
+                        int screenH = GetSystemMetrics(SM_CYSCREEN);
+                        LONG x = (LONG)round(rx * screenW);
+                        LONG y = (LONG)round(ry * screenH);
+                        // set mouse position
+                        INPUT in = {};
+                        in.type = INPUT_MOUSE;
+                        in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+                        // Convert to absolute (0..65535)
+                        in.mi.dx = (LONG)(x * 65535 / (screenW - 1));
+                        in.mi.dy = (LONG)(y * 65535 / (screenH - 1));
+                        SendInput(1, &in, sizeof(INPUT));
+                    } else if (typ == "click" || typ == "mousedown" || typ == "mouseup" || typ == "dblclick") {
+                        int btn = data.value("button", 0);
+                        INPUT in[2] = {};
+                        if (btn == 0) { // left
+                            if (typ == "mousedown") {
+                                in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+                                SendInput(1, &in[0], sizeof(INPUT));
+                            } else if (typ == "mouseup") {
+                                in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                                SendInput(1, &in[0], sizeof(INPUT));
+                            } else if (typ == "click") {
+                                in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+                                in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                                SendInput(2, in, sizeof(INPUT));
+                            } else if (typ == "dblclick") {
+                                in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+                                in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                                SendInput(2, in, sizeof(INPUT));
+                                Sleep(40);
+                                SendInput(2, in, sizeof(INPUT));
+                            }
+                        } else if (btn == 2) { // right
+                            if (typ == "click") {
+                                in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
+                                in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+                                SendInput(2, in, sizeof(INPUT));
+                            }
+                        }
+                    } else if (typ == "wheel") {
+                        int deltaY = data.value("deltaY", 0);
+                        INPUT in = {};
+                        in.type = INPUT_MOUSE;
+                        in.mi.dwFlags = MOUSEEVENTF_WHEEL;
+                        in.mi.mouseData = (DWORD)deltaY;
+                        SendInput(1, &in, sizeof(INPUT));
+                    } else if (typ == "keydown" || typ == "keyup") {
+                        std::string key = data.value("key", "");
+                        // simple mapping for common keys (letters/digits/enter/esc)
+                        SHORT vk = VkKeyScanA(key.size() ? key[0] : 0) & 0xff;
+                        if (vk) {
+                            INPUT in = {};
+                            in.type = INPUT_KEYBOARD;
+                            in.ki.wVk = vk;
+                            if (typ == "keyup") in.ki.dwFlags = KEYEVENTF_KEYUP;
+                            SendInput(1, &in, sizeof(INPUT));
+                        }
+                    }
                 }
+            } catch (std::exception& ex) {
+                std::cout << "JSON parse error: " << ex.what() << "\n";
             }
+        } else {
+            // other socket.io messages
         }
-    } catch (...) {
-        // ignore malformed control
+    } else {
+        // other engine.io frames
     }
 }
 
-void receiverLoop() {
-    const DWORD bufSize = 1024 * 1024; // 1MB buffer
-    std::vector<char> buffer(bufSize);
-    while (keepRunning.load() && connected.load() && hWebSocket) {
-        WINHTTP_WEB_SOCKET_BUFFER_TYPE eType;
-        DWORD read = 0;
-        HRESULT hr = WinHttpWebSocketReceive(hWebSocket, (PVOID)buffer.data(), (DWORD)buffer.size(), &read, &eType);
-        if (FAILED(hr)) {
-            // error or connection closed
+// Reader thread: receive websocket messages
+void recvLoop() {
+    const DWORD buffSize = 8192;
+    std::vector<char> buffer(buffSize);
+    while (keepRunning) {
+        DWORD length = 0;
+        DWORD flags = 0;
+        BOOL res = FALSE;
+        {
+            std::lock_guard<std::mutex> lk(sockMutex);
+            if (!hWebSocket) break;
+            res = WinHttpWebSocketReceive(hWebSocket, (LPVOID)buffer.data(), (DWORD)buffer.size(), &length, &flags);
+        }
+        if (!res) {
+            DWORD err = GetLastError();
+            std::cout << "WebSocket receive failed: " << err << "\n";
             break;
         }
-        if (eType == WINHTTP_WEB_SOCKET_CLOSE_RECEIVED) {
-            // peer closed
+        if (length == 0 && flags == WINHTTP_WEB_SOCKET_CLOSE_FLAG) {
+            std::cout << "WebSocket closed by server\n";
             break;
         }
-        if (read == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(8));
-            continue;
-        }
-        // parse text message
-        try {
-            std::string msg(buffer.data(), buffer.data() + read);
-            auto j = json::parse(msg);
-            // support { action: "control", payload: {...} } OR { type: "control", data: {...} }
-            if (j.contains("action") && j["action"].is_string()) {
-                std::string action = j["action"].get<std::string>();
-                if (action == "control" && j.contains("payload")) {
-                    handleControlMessage(j["payload"]);
-                } else if (action == "start-stream") {
-                    // server asked to start stream; no-op (we stream continuously by default)
-                }
-            } else if (j.contains("type") && j["type"].is_string()) {
-                std::string t = j["type"].get<std::string>();
-                if (t == "control" && j.contains("data")) {
-                    handleControlMessage(j["data"]);
-                } else if (t == "start-stream") {
-                    // optional immediate frame
-                }
-            } else if (j.contains("data") && j["data"].is_object() && j["data"].contains("type")) {
-                handleControlMessage(j["data"]);
-            }
-        } catch (...) {
-            // ignore parse error
+        if (flags & WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE) {
+            std::string msg(buffer.data(), buffer.data() + length);
+            handleTextMessage(msg);
+        } else if (flags & WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
+            // binary message - in our design, binary frames correspond to attachments or ping - ignore
+            // we don't expect server->binary except if server forwards something binary (unlikely)
+            // optionally print size
+            std::cout << "[binary message] size=" << length << "\n";
         }
     }
-    // mark disconnected
-    connected.store(false);
 }
 
-// connectWebSocket with improved error handling
-bool connectWebSocket() {
-    closeWebSocketHandles();
-    // clean server host from scheme if present
-    std::string host = SERVER_HOST;
-    if (host.rfind("https://", 0) == 0) host = host.substr(8);
-    if (host.rfind("http://", 0) == 0) host = host.substr(7);
-    if (host.rfind("wss://", 0) == 0) host = host.substr(6);
-    if (host.rfind("ws://", 0) == 0) host = host.substr(5);
-    // remove trailing slash
-    if (!host.empty() && host.back() == '/') host.pop_back();
-
-    hSession = WinHttpOpen(L"RemoteAgent/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) {
-        std::cerr << "[!] WinHttpOpen failed\n";
+// Main connect routine (engine.io websocket)
+bool connectSocketIO() {
+    std::wstring host, path;
+    INTERNET_PORT port = 0; bool secure = true;
+    if (!parseUrl(configServer, host, path, port, secure)) {
+        std::cout << "Invalid server URL in config\n";
         return false;
     }
+    // append socket.io query params
+    std::wstring fullPath = path + L"/socket.io/?EIO=4&transport=websocket";
+    URL_COMPONENTS uc = {};
+    uc.dwStructSize = sizeof(uc);
+    uc.lpszHostName = (LPWSTR)host.c_str();
+    uc.dwHostNameLength = (DWORD)host.size();
+    const wchar_t* userAgent = L"AgentClient/1.0";
 
-    std::wstring hostW = utf8_to_wstring(host);
-    hConnect = WinHttpConnect(hSession, hostW.c_str(), SERVER_PORT, 0);
-    if (!hConnect) {
-        std::cerr << "[!] WinHttpConnect failed\n";
-        closeWebSocketHandles();
-        return false;
+    hSession = WinHttpOpen(userAgent, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) { std::cout << "WinHttpOpen failed\n"; return false; }
+
+    hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
+    if (!hConnect) { std::cout << "WinHttpConnect failed\n"; return false; }
+
+    hRequest = WinHttpOpenRequest(hConnect, L"GET", fullPath.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0);
+    if (!hRequest) { std::cout << "WinHttpOpenRequest failed\n"; return false; }
+
+    // upgrade to websocket
+    BOOL ok = WinHttpWebSocketCompleteUpgrade(hRequest, NULL);
+    if (!ok) {
+        // In practice, you must call WinHttpSendRequest/ReceiveResponse before CompleteUpgrade
+        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+            std::cout << "WinHttpSendRequest failed\n"; return false;
+        }
+        if (!WinHttpReceiveResponse(hRequest, NULL)) {
+            std::cout << "WinHttpReceiveResponse failed\n"; return false;
+        }
+        hWebSocket = WinHttpWebSocketCompleteUpgrade(hRequest, NULL);
+        if (!hWebSocket) { std::cout << "WinHttpWebSocketCompleteUpgrade failed\n"; return false; }
+    } else {
+        // rarely used path
+        hWebSocket = WinHttpWebSocketCompleteUpgrade(hRequest, NULL);
+        if (!hWebSocket) { std::cout << "WinHttpWebSocketCompleteUpgrade failed (2)\n"; return false; }
     }
 
-    std::string path = "/ws-agent?room=" + ROOM;
-    std::wstring pathW = utf8_to_wstring(path);
-
-    // secure flag if port is 443
-    DWORD flags = (SERVER_PORT == 443) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", pathW.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hRequest) {
-        std::cerr << "[!] WinHttpOpenRequest failed\n";
-        closeWebSocketHandles();
-        return false;
-    }
-
-    // try send + receive
-    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-        std::cerr << "[!] WinHttpSendRequest failed\n";
-        WinHttpCloseHandle(hRequest);
-        closeWebSocketHandles();
-        return false;
-    }
-    if (!WinHttpReceiveResponse(hRequest, NULL)) {
-        std::cerr << "[!] WinHttpReceiveResponse failed\n";
-        WinHttpCloseHandle(hRequest);
-        closeWebSocketHandles();
-        return false;
-    }
-
-    // query status code
-    DWORD status = 0;
-    DWORD statusSize = sizeof(status);
-    if (!WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX)) {
-        std::cerr << "[!] WinHttpQueryHeaders failed\n";
-        WinHttpCloseHandle(hRequest);
-        closeWebSocketHandles();
-        return false;
-    }
-    if (status != 101) {
-        std::cerr << "[!] HTTP status not 101 (got " << status << ")\n";
-        WinHttpCloseHandle(hRequest);
-        closeWebSocketHandles();
-        return false;
-    }
-
-    HINTERNET hUpgraded = WinHttpWebSocketCompleteUpgrade(hRequest, 0);
-    if (!hUpgraded) {
-        std::cerr << "[!] WinHttpWebSocketCompleteUpgrade failed\n";
-        WinHttpCloseHandle(hRequest);
-        closeWebSocketHandles();
-        return false;
-    }
-
-    hWebSocket = hUpgraded;
-    connected.store(true);
+    std::cout << "WebSocket connected\n";
     return true;
 }
 
-// ---------- Main agent loop ----------
-void runAgentLoop() {
-    int backoff = 3;
-    while (keepRunning.load()) {
-        std::cerr << "[*] Connecting to " << SERVER_HOST << ":" << SERVER_PORT << " room=" << ROOM << "\n";
-        if (!connectWebSocket()) {
-            std::cerr << "[!] Connect failed, retrying in " << backoff << "s\n";
-            std::this_thread::sleep_for(std::chrono::seconds(backoff));
-            backoff = std::min(60, backoff * 2);
-            continue;
-        }
-        backoff = 3;
+int wmain(int argc, wchar_t* argv[]) {
+    // init GDI+
+    ULONG_PTR gdiplusToken;
+    GdiplusStartupInput gdiplusStartupInput;
+    GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
 
-        // send hello
-        json hello = { {"type","hello"}, {"roomId", ROOM}, {"agentId", AGENT_ID} };
-        if (!sendJsonMessage(hello.dump())) {
-            std::cerr << "[!] Failed to send hello\n";
-            closeWebSocketHandles();
-            continue;
-        }
+    loadConfig();
+    std::cout << "Server: " << configServer << "\nRoom: " << configRoom << "\nName: " << configName << "\nFPS: " << configFps << "\n";
 
-        // start receiving thread
-        std::thread recvThread(receiverLoop);
-
-        // send frames while connected
-        while (keepRunning.load() && connected.load()) {
-            int w=0,h=0;
-            std::string b64;
-            bool ok = CaptureScreenToJpegBase64(b64, w, h);
-            if (ok && !b64.empty()) {
-                json frame = {
-                    {"type","frame"},
-                    {"roomId", ROOM},
-                    {"agentId", AGENT_ID},
-                    {"width", w},
-                    {"height", h},
-                    {"image", b64}
-                };
-                if (!sendJsonMessage(frame.dump())) {
-                    std::cerr << "[!] sendJsonMessage failed (will reconnect)\n";
-                    connected.store(false);
-                    break;
-                }
-            } else {
-                std::cerr << "[!] Capture failed\n";
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(FRAME_MS));
-        }
-
-        if (recvThread.joinable()) recvThread.join();
-        closeWebSocketHandles();
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-    }
-}
-
-// -------- config loader --------
-void loadConfig() {
-    try {
-        std::ifstream f("config.json");
-        if (!f.good()) return;
-        json cfg; f >> cfg;
-        if (cfg.contains("roomId")) ROOM = cfg["roomId"].get<std::string>();
-        if (cfg.contains("server")) SERVER_HOST = cfg["server"].get<std::string>();
-        if (cfg.contains("port")) SERVER_PORT = cfg["port"].get<int>();
-        if (cfg.contains("agentId")) AGENT_ID = cfg["agentId"].get<std::string>();
-        if (cfg.contains("fps")) {
-            int fps = cfg["fps"].get<int>();
-            if (fps > 0) FRAME_MS = 1000 / fps;
-        }
-        if (cfg.contains("maxWidth")) MAX_WIDTH = cfg["maxWidth"].get<int>();
-        if (cfg.contains("jpegQuality")) JPEG_QUALITY = cfg["jpegQuality"].get<int>();
-    } catch (...) {
-        // ignore parse errors
-    }
-}
-
-// -------- console handler --------
-BOOL WINAPI ConsoleHandler(DWORD signal) {
-    if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT || signal == CTRL_BREAK_EVENT) {
-        keepRunning.store(false);
-        connected.store(false);
-        closeWebSocketHandles();
-        return TRUE;
-    }
-    return FALSE;
-}
-
-// -------- main --------
-int main() {
-    SetConsoleTitleA("Remote Agent - C++ (WSS)");
-    GdiplusStartupInput gsi;
-    ULONG_PTR token;
-    if (GdiplusStartup(&token, &gsi, NULL) != Ok) {
-        std::cerr << "[!] GdiplusStartup failed\n";
+    if (!connectSocketIO()) {
+        std::cout << "Failed to connect to server\n";
         return 1;
     }
 
-    loadConfig();
-    std::cerr << "[*] Agent starting. Server=" << SERVER_HOST << ":" << SERVER_PORT << " Room=" << ROOM << " AgentId=" << AGENT_ID << "\n";
-    SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+    // start receiver thread
+    std::thread recvThread(recvLoop);
 
-    runAgentLoop();
+    // Main loop: capture & send frames when granted
+    while (keepRunning) {
+        if (granted) {
+            int w=0,h=0;
+            auto img = captureScreenJpeg(w,h, 55);
+            if (!img.empty()) {
+                // send via socket.io binary mechanism
+                if (!sendFrameAsSocketIOBinary(img)) {
+                    std::cout << "Failed to send frame\n";
+                    // continue but maybe break
+                } else {
+                    std::cout << "Sent frame size=" << img.size() << " " << w << "x" << h << "\n";
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000 / max(1, configFps)));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
 
-    GdiplusShutdown(token);
-    std::cerr << "[*] Agent exiting cleanly\n";
+    // cleanup
+    if (hWebSocket) {
+        WinHttpWebSocketClose(hWebSocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+        WinHttpCloseHandle(hWebSocket);
+    }
+    if (hRequest) WinHttpCloseHandle(hRequest);
+    if (hConnect) WinHttpCloseHandle(hConnect);
+    if (hSession) WinHttpCloseHandle(hSession);
+
+    GdiplusShutdown(gdiplusToken);
+    if (recvThread.joinable()) recvThread.join();
     return 0;
 }
