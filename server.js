@@ -104,12 +104,31 @@ io.on("connection", socket => {
 
   // Viewer requests owner/agent to share
   socket.on("request-screen", ({ roomId, from }) => {
-    socket.to(roomId).emit("screen-request", { from, name: peers[socket.id]?.name });
+    // Find first non-agent user in the room other than requester (owner)
+    const ownerEntry = Object.entries(peers).find(([id, p]) => p.roomId === roomId && !p.isAgent && id !== from);
+    if (ownerEntry) {
+      const [ownerId] = ownerEntry;
+      io.to(ownerId).emit("screen-request", { from, name: peers[from]?.name || "Viewer" });
+      console.log(`➡ screen-request from ${from} to owner ${ownerId} in room ${roomId}`);
+    } else {
+      // If no owner found, fallback: try any non-requester socket in room
+      const anyEntry = Object.entries(peers).find(([id, p]) => p.roomId === roomId && id !== from);
+      if (anyEntry) {
+        const [someId] = anyEntry;
+        io.to(someId).emit("screen-request", { from, name: peers[from]?.name || "Viewer" });
+        console.log(`⚠ No explicit owner found; forwarded screen-request from ${from} to ${someId} in room ${roomId}`);
+      } else {
+        io.to(from).emit("no-agent", { message: "No owner present in that room to accept your request." });
+        console.log(`⚠ No potential recipient for screen-request from ${from} in room ${roomId}`);
+      }
+    }
   });
 
   // Owner responds (accept/deny)
   socket.on("permission-response", ({ to, accepted }) => {
+    // 'socket' here is the owner who clicked accept/reject
     if (accepted && peers[socket.id]) peers[socket.id].isSharing = true;
+
     // Notify the requesting viewer
     io.to(to).emit("permission-result", accepted);
 
@@ -118,16 +137,26 @@ io.on("connection", socket => {
       const roomId = peers[socket.id] && peers[socket.id].roomId;
       const agents = Object.entries(peers).filter(([id,p]) => p.roomId === roomId && p.isAgent).map(([id]) => id);
       if (agents.length === 0) {
-        // No agent present — tell the owner/viewer to download agent
+        // No agent present — tell the viewer (requester) there's no agent
         io.to(to).emit("no-agent", { message: "No agent present. Please ask owner to download and run the agent." });
-        // Also notify the owner so they can offer download link
+        // Also notify the owner so they can offer download link (owner-only)
         io.to(socket.id).emit("offer-download-agent", { roomId });
+        console.log(`ℹ No agent in room ${roomId} — notified viewer ${to} and owner ${socket.id}`);
       } else {
-        // grant control: attach first agent (simple approach)
+        // grant control: pick first agent
         const agentId = agents[0];
+
+        // If that agent was already assigned to another viewer, revoke that previous viewer first
+        const prevViewer = allowedControllers[agentId];
+        if (prevViewer && prevViewer !== to) {
+          // tell previous viewer and agent
+          io.to(prevViewer).emit("revoke-control", {});
+          console.log(`↩ Revoked previous viewer ${prevViewer} for agent ${agentId}`);
+        }
+
         allowedControllers[agentId] = to;
         io.to(agentId).emit("grant-control", { viewerId: to });
-        console.log(`Granted control for agent ${agentId} to viewer ${to}`);
+        console.log(`✅ Granted control for agent ${agentId} to viewer ${to} (room ${roomId})`);
         // emit token to viewer (optional)
         const token = Math.random().toString(36).slice(2,10);
         io.to(to).emit("control-token", token);
@@ -141,6 +170,7 @@ io.on("connection", socket => {
           io.to(aid).emit("revoke-control", {});
         }
       }
+      console.log(`❌ Permission denied by ${socket.id} for request to ${to} in room ${roomId}`);
     }
   });
 
@@ -158,15 +188,12 @@ io.on("connection", socket => {
     const agentId = socket.id;
     const viewerId = allowedControllers[agentId];
     if (viewerId) {
+      // Only forward frames to the specifically allowed viewer
       io.to(viewerId).emit("frame", buffer);
     } else {
-      // if no allowed viewer, do nothing (or optionally broadcast)
-      const roomId = peers[agentId] && peers[agentId].roomId;
-      if (roomId) {
-        for (const [id,p] of Object.entries(peers)) {
-          if (p.roomId === roomId && !p.isAgent) io.to(id).emit("frame", buffer);
-        }
-      }
+      // No viewer allowed — DO NOT broadcast frames to entire room.
+      // Keep this silent to avoid leaking screens to everyone.
+      // console.log(`Frame received from ${agentId} but no allowed viewer set.`);
     }
   });
 
