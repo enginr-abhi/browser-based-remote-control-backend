@@ -21,7 +21,7 @@ try {
   else if (process.env.ROOM) ROOM = process.env.ROOM;
 } catch (e) { console.warn("config read failed", e); }
 
-const SERVER = process.env.SERVER || "http://localhost:9000";
+const SERVER = process.env.SERVER || "https://browser-based-remote-control-backend.onrender.com";
 const socket = io(SERVER, { transports: ["websocket"], reconnection: true, maxHttpBufferSize: 10 * 1024 * 1024 });
 
 const FPS = 8;
