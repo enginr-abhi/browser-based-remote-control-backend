@@ -1,9 +1,3 @@
 {
-  "roomId": "room1",
-  "server": "browser-based-remote-control-backend.onrender.com",
-  "port": 443,
-  "agentId": "agent-cpp-001",
-  "fps": 4,
-  "maxWidth": 1366,
-  "jpegQuality": 60
+  "roomId": "room1"
 }
