@@ -1,437 +1,468 @@
-// agent.cpp
-// Compile:
-// cl /EHsc agent.cpp /link winhttp.lib gdiplus.lib user32.lib gdi32.lib ole32.lib
-//
-// Requires Windows (WinHTTP, GDI+, SendInput). Place a config.json next to exe.
-//
-// Basic socket.io (engine.io v4) minimal implementation over WebSocket (WinHTTP).
-// Sends "set-name" and "join-room" (isAgent=true), captures screen to JPEG and
-// sends as binary attachment for event "frame". Handles "grant-control" and "control" events.
-
+#include <winsock2.h>
 #include <windows.h>
-#include <winhttp.h>
 #include <gdiplus.h>
-#include <iostream>
-#include <vector>
+#include <ws2tcpip.h>
 #include <string>
 #include <thread>
-#include <atomic>
-#include <fstream>
+#include <iostream>
 #include <sstream>
-#include <iomanip>
-#include <chrono>
-#include <mutex>
-#include <nlohmann/json.hpp> // include nlohmann/json.hpp in include path
+#include <vector>
+#include <cstdlib> 
+#include <algorithm> // for std::transform
+#include <cctype> // for std::toupper
 
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "gdiplus.lib")
+// Linker pragma (ensure these are present in your actual file if needed)
+// #pragma comment(lib, "ws2_32.lib")
+// #pragma comment(lib, "gdiplus.lib")
 
-using json = nlohmann::json;
 using namespace Gdiplus;
 
-std::string configServer = "https://browser-based-remote-control-backend.onrender.com";
-std::string configRoom = "room1";
-std::string configName = "agent-pc";
-int configFps = 5;
-bool sendCursor = true;
+// --- Global Variables (Hardcoded/Fixed) ---
+SOCKET ws;
+bool running = true;
+int screenW, screenH;
+ULONG_PTR token; 
 
-std::atomic<bool> keepRunning(true);
-std::atomic<bool> granted(false);
-std::mutex sockMutex;
+// ✅ FIX: Hardcoded Server Configuration
+// NOTE: Live Deployment ke liye "127.0.0.1" ko apne domain name se badalna mat bhoolna!
+const std::string SERVER_IP = "127.0.0.1";
+const int SERVER_PORT = 9000;
+const std::string ROOM_ID = "room1"; 
 
-HINTERNET hSession = NULL;
-HINTERNET hConnect = NULL;
-HINTERNET hRequest = NULL;
-HINTERNET hWebSocket = NULL;
+std::string ip = SERVER_IP; 	
+std::string room = ROOM_ID; 	
 
-// Utility: read config.json
-void loadConfig() {
-    std::ifstream f("config.json");
-    if (!f.is_open()) return;
-    try {
-        json j; f >> j;
-        if (j.contains("server")) configServer = j["server"].get<std::string>();
-        if (j.contains("roomId")) configRoom = j["roomId"].get<std::string>();
-        if (j.contains("name")) configName = j["name"].get<std::string>();
-        if (j.contains("fps")) configFps = j["fps"].get<int>();
-        if (j.contains("sendCursor")) sendCursor = j["sendCursor"].get<bool>();
-    } catch (...) {
-        std::cout << "Failed parsing config.json\n";
+
+// --- Helper Functions Forward Declarations ---
+void handleControl(const std::string& msg); 
+void captureJPEG(std::vector<BYTE>& buf);
+void streamThread();
+void ws_mask_send(const std::vector<BYTE>& payload, int opcode);
+void ws_send(const std::vector<BYTE>& buf);
+void listenThread();
+
+// Helper function to get the CLSID of the JPEG encoder
+int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
+	UINT num = 0; 			// number of image encoders
+	UINT size = 0; 		 // size of the image encoder array in bytes
+	ImageCodecInfo* pImageCodecInfo = NULL;
+
+	GetImageEncodersSize(&num, &size);
+	if (size == 0) return -1;
+
+	pImageCodecInfo = (ImageCodecInfo*)(malloc(size));
+	if (pImageCodecInfo == NULL) return -1;
+
+	GetImageEncoders(num, size, pImageCodecInfo);
+
+	for (UINT j = 0; j < num; ++j) {
+		if (wcscmp(pImageCodecInfo[j].MimeType, format) == 0) {
+			*pClsid = pImageCodecInfo[j].Clsid;
+			free(pImageCodecInfo);
+			return j;
+		} 	
+	}
+
+	free(pImageCodecInfo);
+	return -1;
+}
+
+// Helper: Virtual Key code mapping (Added for keyboard control)
+BYTE getVkCode(const std::string& key) {
+    if (key.length() == 1 && std::isalpha(key[0])) {
+        // Simple letters (A-Z)
+        return (BYTE)std::toupper(key[0]);
     }
+
+    if (key.length() == 1 && std::isdigit(key[0])) {
+        // Numbers (0-9)
+        return (BYTE)(key[0]); // ASCII '0' to '9' corresponds to VK_0 to VK_9
+    }
+
+    if (key == "Enter") return VK_RETURN;
+    if (key == "Shift") return VK_SHIFT;
+    if (key == "Control") return VK_CONTROL;
+    if (key == "Alt") return VK_MENU;
+    if (key == "Backspace") return VK_BACK;
+    if (key == "Tab") return VK_TAB;
+    if (key == "Escape") return VK_ESCAPE;
+    if (key == "Delete") return VK_DELETE;
+    if (key == "ArrowUp") return VK_UP;
+    if (key == "ArrowDown") return VK_DOWN;
+    if (key == "ArrowLeft") return VK_LEFT;
+    if (key == "ArrowRight") return VK_RIGHT;
+    if (key == "Home") return VK_HOME;
+    if (key == "End") return VK_END;
+    if (key == "PageUp") return VK_PRIOR;
+    if (key == "PageDown") return VK_NEXT;
+    if (key == "F1") return VK_F1;
+    if (key == "F12") return VK_F12; // Example for function keys
+    if (key == " ") return VK_SPACE;
+    
+    // NOTE: Special characters like !, @, # require Shift check (complex)
+    return 0; 
 }
 
-// Helper: parse host and path from server URL
-bool parseUrl(const std::string& url, std::wstring& hostOut, std::wstring& pathOut, INTERNET_PORT& portOut, bool& secure) {
-    // supports https://host[:port]/path
-    std::string u = url;
-    secure = false;
-    if (u.rfind("https://",0) == 0) { secure = true; u = u.substr(8); portOut = INTERNET_DEFAULT_HTTPS_PORT; }
-    else if (u.rfind("http://",0) == 0) { secure = false; u = u.substr(7); portOut = INTERNET_DEFAULT_HTTP_PORT; }
-    else { return false; }
-    size_t slash = u.find('/');
-    std::string host = (slash == std::string::npos) ? u : u.substr(0, slash);
-    std::string path = (slash == std::string::npos) ? std::string("/") : u.substr(slash);
-    // remove trailing /
-    hostOut = std::wstring(host.begin(), host.end());
-    pathOut = std::wstring(path.begin(), path.end());
-    return true;
+// ======================================
+// 🛠️ WS SEND WITH FRAMING & MASKING
+// ======================================
+
+void ws_mask_send(const std::vector<BYTE>& payload, int opcode) {
+	if (ws == INVALID_SOCKET || payload.empty()) return;
+	
+	std::vector<BYTE> frame;
+	size_t length = payload.size();
+
+	// 1. First Byte (FIN=1, Opcode) - 0x82 for Binary
+	frame.push_back(0x80 | opcode); 
+
+	// 2. Second Byte (Mask=1, Payload Length)
+	if (length <= 125) {
+		frame.push_back(0x80 | (BYTE)length);
+	} else if (length <= 65535) {
+		frame.push_back(0x80 | 126);
+		frame.push_back((BYTE)(length >> 8));
+		frame.push_back((BYTE)length);
+	} else {
+		frame.push_back(0x80 | 127);
+		// 8-byte extended payload length
+		for (int i = 7; i >= 0; i--) {
+			frame.push_back((BYTE)((length >> (i * 8)) & 0xFF));
+		}
+	}
+
+	// 3. Masking Key (4 bytes)
+	BYTE mask[4];
+	for (int i = 0; i < 4; i++) {
+		mask[i] = (BYTE)(rand() % 256);
+		frame.push_back(mask[i]);
+	}
+
+	// 4. Masked Payload
+	std::vector<BYTE> masked_payload(length);
+	for (size_t i = 0; i < length; i++) {
+		masked_payload[i] = payload[i] ^ mask[i % 4]; 
+	}
+	frame.insert(frame.end(), masked_payload.begin(), masked_payload.end());
+
+	// 5. Send the full frame
+	send(ws, (const char*)frame.data(), frame.size(), 0);
 }
 
-// Send text websocket frame (WinHTTP) - wrapper
-bool wsSendText(const std::string& msg) {
-    std::lock_guard<std::mutex> lk(sockMutex);
-    if (!hWebSocket) return false;
-    BOOL ok = WinHttpWebSocketSend(hWebSocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, (LPVOID)msg.c_str(), (DWORD)msg.size());
-    return ok == TRUE;
+void ws_send(const std::vector<BYTE>& buf) {
+	ws_mask_send(buf, 0x02); // 0x02 = Binary Frame (for JPEG)
 }
 
-// Send binary websocket frame
-bool wsSendBinary(const std::vector<unsigned char>& data) {
-    std::lock_guard<std::mutex> lk(sockMutex);
-    if (!hWebSocket) return false;
-    BOOL ok = WinHttpWebSocketSend(hWebSocket, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, (LPVOID)data.data(), (DWORD)data.size());
-    return ok == TRUE;
+// ======================================
+// 🖼️ CAPTURE AND ENCODE FUNCTION
+// ======================================
+void captureJPEG(std::vector<BYTE>& buf) {
+	// 1. Clear previous buffer data
+	buf.clear(); 
+
+	// Get screen device context
+	HDC hDesktop = GetDC(NULL);
+	HDC hCapture = CreateCompatibleDC(hDesktop);
+
+	// Create a bitmap object
+	HBITMAP hBitmap = CreateCompatibleBitmap(hDesktop, screenW, screenH);
+	SelectObject(hCapture, hBitmap);
+
+	// Copy screen to memory (hCapture)
+	BitBlt(hCapture, 0, 0, screenW, screenH, hDesktop, 0, 0, SRCCOPY | CAPTUREBLT);
+	
+	// Release resources early
+	ReleaseDC(NULL, hDesktop);
+	DeleteDC(hCapture);
+
+	// 2. GDI+ Bitmap creation
+	Bitmap* pBitmap = new Bitmap(hBitmap, NULL);
+	CLSID clsidEncoder;
+	
+	// Get JPEG Encoder CLSID
+	if (GetEncoderClsid(L"image/jpeg", &clsidEncoder) != -1) {
+		// Create an IStream to save the JPEG data to memory
+		IStream* pStream = NULL;
+		if (CreateStreamOnHGlobal(NULL, TRUE, &pStream) == S_OK) {
+			
+			// 3. Save Bitmap to IStream as JPEG
+			// Set Quality to 50
+			EncoderParameters encoderParams;
+			encoderParams.Count = 1;
+			encoderParams.Parameter[0].Guid = EncoderQuality;
+			encoderParams.Parameter[0].Type = EncoderParameterValueTypeLong;
+			encoderParams.Parameter[0].NumberOfValues = 1;
+			
+			ULONG quality = 50; 
+			encoderParams.Parameter[0].Value = &quality;
+
+			if (pBitmap->Save(pStream, &clsidEncoder, &encoderParams) == Ok) {
+				// 4. Read IStream data into std::vector<BYTE> (buf)
+				STATSTG statstg;
+				pStream->Stat(&statstg, STATFLAG_NONAME);
+				ULARGE_INTEGER ulnSize = statstg.cbSize;
+				
+				buf.resize((size_t)ulnSize.QuadPart);
+				
+				LARGE_INTEGER liZero = {0};
+				pStream->Seek(liZero, STREAM_SEEK_SET, NULL); 
+
+				pStream->Read(buf.data(), (ULONG)ulnSize.QuadPart, NULL);
+			}
+			pStream->Release();
+		}
+	}
+
+	// 5. Cleanup
+	delete pBitmap;
+	DeleteObject(hBitmap);
 }
 
-// GDI+ capture to JPEG in memory
-std::vector<unsigned char> captureScreenJpeg(int& outW, int& outH, ULONG quality = 60) {
-    std::vector<unsigned char> out;
-    HDC hScreenDC = GetDC(NULL);
-    int width = GetSystemMetrics(SM_CXSCREEN);
-    int height = GetSystemMetrics(SM_CYSCREEN);
-    outW = width; outH = height;
+// ======================================
+// 🖱️ MOUSE & ⌨️ KEYBOARD CONTROL HANDLING FUNCTION (FIXED)
+// ======================================
+void handleControl(const std::string& msg) {
+    // NOTE: This uses basic string search/parsing, assuming the JSON format is consistent.
+    
+    // --- 1. MOUSE CONTROL ---
+    if (msg.find("\"type\":\"mouse\"") != std::string::npos) {
+        
+        // --- 1.1 Extract Mouse Data ---
+        size_t x_pos = msg.find("\"x\":");
+        size_t y_pos = msg.find("\"y\":");
+        size_t act_pos = msg.find("\"action\":\"");
+        size_t btn_pos = msg.find("\"button\":");
 
-    HDC hMemDC = CreateCompatibleDC(hScreenDC);
-    HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
-    HGDIOBJ oldBmp = SelectObject(hMemDC, hBitmap);
-    BitBlt(hMemDC, 0, 0, width, height, hScreenDC, 0, 0, SRCCOPY | CAPTUREBLT);
-    SelectObject(hMemDC, oldBmp);
+        if (x_pos == std::string::npos || y_pos == std::string::npos || act_pos == std::string::npos) return;
 
-    // GDI+ Bitmap from HBITMAP
-    Bitmap bmp(hBitmap, NULL);
-    // Save to IStream
-    IStream* istream = NULL;
-    if (CreateStreamOnHGlobal(NULL, TRUE, &istream) == S_OK) {
-        CLSID clsidEncoder;
-        // find jpeg CLSID
-        UINT num = 0, size = 0;
-        GetImageEncodersSize(&num, &size);
-        if (size > 0) {
-            ImageCodecInfo* pImageCodecInfo = (ImageCodecInfo*)(malloc(size));
-            if (pImageCodecInfo) {
-                GetImageEncoders(num, size, pImageCodecInfo);
-                for (UINT j = 0; j < num; ++j) {
-                    if (wcscmp(pImageCodecInfo[j].MimeType, L"image/jpeg") == 0) {
-                        clsidEncoder = pImageCodecInfo[j].Clsid;
-                        break;
-                    }
-                }
-                free(pImageCodecInfo);
-                // encoder parameters
-                EncoderParameters encoderParams;
-                encoderParams.Count = 1;
-                encoderParams.Parameter[0].Guid = EncoderQuality;
-                encoderParams.Parameter[0].Type = EncoderParameterValueTypeLong;
-                encoderParams.Parameter[0].NumberOfValues = 1;
-                encoderParams.Parameter[0].Value = &quality;
-                if (bmp.Save(istream, &clsidEncoder, &encoderParams) == Ok) {
-                    // read stream into buffer
-                    LARGE_INTEGER zero = {}; ULARGE_INTEGER size2 = {};
-                    IStream_GetSize(istream, &size2);
-                    // Rewind
-                    LARGE_INTEGER liZero; liZero.QuadPart = 0;
-                    istream->Seek(liZero, STREAM_SEEK_SET, NULL);
-                    // read
-                    STATSTG statstg;
-                    if (istream->Stat(&statstg, STATFLAG_NONAME) == S_OK) {
-                        ULONG toRead = (ULONG)statstg.cbSize.QuadPart;
-                        out.resize(toRead);
-                        ULONG actuallyRead = 0;
-                        istream->Read(out.data(), toRead, &actuallyRead);
-                        out.resize(actuallyRead);
-                    }
-                }
+        // Extract values using simple substring/find (assuming float/int format)
+        std::string x_str = msg.substr(x_pos + 4, msg.find(",", x_pos) - (x_pos + 4));
+        std::string y_str = msg.substr(y_pos + 4, msg.find(",", y_pos) - (y_pos + 4));
+        std::string action_str = msg.substr(act_pos + 10, msg.find("\"", act_pos + 10) - (act_pos + 10));
+        std::string button_str = msg.substr(btn_pos + 9, msg.find("}", btn_pos) - (btn_pos + 9)); 
+
+        float x_norm = std::stof(x_str);
+        float y_norm = std::stof(y_str);
+        int button_code = std::stoi(button_str);
+
+        // --- 1.2 Setup Input Structure ---
+        INPUT input = {0};
+        input.type = INPUT_MOUSE;
+
+        // 🎯 FIX APPLIED: Normalized coordinates (0.0 to 1.0) ko Absolute Windows Coordinates (0 se 65535) 
+
+         int x_abs = (int)(x_norm * 65536.0f); 
+         int y_abs = (int)(y_norm * 65536.0f);
+
+
+        x_abs = std::min(x_abs, 65535);
+        y_abs = std::min(y_abs, 65535);
+        
+        // --- 1.3 Send Movement (Always needed for accurate click position) ---
+        input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+        input.mi.dx = x_abs;
+        input.mi.dy = y_abs;
+        SendInput(1, &input, sizeof(INPUT));
+
+        // --- 1.4 Handle Button Actions ---
+        if (action_str == "down" || action_str == "up") {
+            DWORD dwFlag = 0;
+            
+            if (button_code == 0) { // Left Button (Primary)
+                dwFlag = (action_str == "down") ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+            } else if (button_code == 2) { // Right Button (Secondary)
+                dwFlag = (action_str == "down") ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+            } else if (button_code == 1) { // Middle Button
+                dwFlag = (action_str == "down") ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+            }
+            
+            if (dwFlag != 0) {
+                input.mi.dwFlags = dwFlag;
+                // Position ko 0 rakhte hain kyonki yeh position pehle hi MOUSEEVENTF_MOVE se set ho chuki hai.
+               input.mi.dx = 0; 
+               input.mi.dy = 0;
+                SendInput(1, &input, sizeof(INPUT));
             }
         }
-        istream->Release();
+    } 
+
+    // --- 2. SCROLL CONTROL ---
+    else if (msg.find("\"type\":\"scroll\"") != std::string::npos) {
+        size_t delta_pos = msg.find("\"delta\":");
+        if (delta_pos == std::string::npos) return;
+        
+        // Extract delta value
+        std::string delta_str = msg.substr(delta_pos + 8, msg.find("}", delta_pos) - (delta_pos + 8));
+        int delta = std::stoi(delta_str);
+
+        INPUT input = {0};
+        input.type = INPUT_MOUSE;
+        input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+        // Invert delta and reduce sensitivity
+        input.mi.mouseData = (DWORD)(-delta / 3); 
+        
+        SendInput(1, &input, sizeof(INPUT));
     }
+    
+    // --- 3. KEYBOARD CONTROL ---
+    else if (msg.find("\"type\":\"key\"") != std::string::npos) {
+        size_t key_pos = msg.find("\"key\":\"");
+        size_t state_pos = msg.find("\"state\":\"");
 
-    // cleanup
-    DeleteObject(hBitmap);
-    DeleteDC(hMemDC);
-    ReleaseDC(NULL, hScreenDC);
-    return out;
-}
+        if (key_pos == std::string::npos || state_pos == std::string::npos) return;
 
-// Simple JSON escape for small usage (we'll rely on nlohmann to produce payloads)
-std::string jsonEmitText(const std::string& event, const json& payload) {
-    json arr = json::array();
-    arr.push_back(event);
-    if (payload.is_null()) arr.push_back(json::object());
-    else arr.push_back(payload);
-    std::string s = "42" + arr.dump();
-    return s;
-}
+        // Extract key and state
+        std::string key_str = msg.substr(key_pos + 7, msg.find("\"", key_pos + 7) - (key_pos + 7));
+        std::string state_str = msg.substr(state_pos + 9, msg.find("\"", state_pos + 9) - (state_pos + 9));
 
-// Send event with single binary attachment: text '42["frame", {"_placeholder":true,"num":0}]' then binary image
-bool sendFrameAsSocketIOBinary(const std::vector<unsigned char>& jpeg) {
-    // text frame describing event with placeholder for one binary attachment
-    json arr = json::array();
-    arr.push_back("frame");
-    json placeholder = { { "_placeholder", true }, { "num", 0 } };
-    arr.push_back(placeholder);
-    std::string text = "42" + arr.dump();
-    if (!wsSendText(text)) return false;
-    // then send binary payload as separate binary websocket message
-    if (!wsSendBinary(jpeg)) return false;
-    return true;
-}
+        BYTE vk = getVkCode(key_str);
 
-// Handle inbound text messages from socket.io/engine.io
-void handleTextMessage(const std::string& msg) {
-    if (msg.size() == 0) return;
-    char t = msg[0];
-    if (t == '0') {
-        // open packet: msg = 0{...}
-        std::string jsonPart = msg.substr(1);
-        std::cout << "[engine.io open] " << jsonPart << "\n";
-        // after open, send '40' to connect socket.io namespace
-        wsSendText("40");
-        // emit set-name and join-room
-        json jn = { {"name", configName} };
-        wsSendText(jsonEmitText("set-name", jn));
-        json jr = { {"roomId", configRoom}, {"name", configName}, {"isAgent", true} };
-        wsSendText(jsonEmitText("join-room", jr));
-        std::cout << "Sent join-room\n";
-    } else if (t == '3') {
-        // pong or pong ack
-        // ignore
-    } else if (t == '2') {
-        // ping from server; reply with '3'
-        wsSendText("3");
-    } else if (t == '4') {
-        // Socket.IO message: starts with '4' then second char is engine packet type; usually '42' for event
-        if (msg.size() >= 2 && msg[1] == '2') {
-            std::string jsonPart = msg.substr(2);
-            try {
-                json arr = json::parse(jsonPart);
-                if (!arr.is_array() || arr.size() < 1) return;
-                std::string event = arr[0].get<std::string>();
-                json data = arr.size() >= 2 ? arr[1] : json();
-                std::cout << "[event] " << event << " -> " << data.dump() << "\n";
-                if (event == "grant-control") {
-                    // server tells agent to allow frames for viewer
-                    granted = true;
-                    std::cout << "Granted control to viewer: " << data.dump() << "\n";
-                } else if (event == "revoke-control") {
-                    granted = false;
-                    std::cout << "Revoke control\n";
-                } else if (event == "control") {
-                    // viewer control event: move/click/keyboard
-                    // data may contain type, x,y,button, captureWidth/captureHeight
-                    std::string typ = data.value("type", "");
-                    if (typ == "mousemove") {
-                        double rx = data.value("x", 0.0);
-                        double ry = data.value("y", 0.0);
-                        int screenW = GetSystemMetrics(SM_CXSCREEN);
-                        int screenH = GetSystemMetrics(SM_CYSCREEN);
-                        LONG x = (LONG)round(rx * screenW);
-                        LONG y = (LONG)round(ry * screenH);
-                        // set mouse position
-                        INPUT in = {};
-                        in.type = INPUT_MOUSE;
-                        in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-                        // Convert to absolute (0..65535)
-                        in.mi.dx = (LONG)(x * 65535 / (screenW - 1));
-                        in.mi.dy = (LONG)(y * 65535 / (screenH - 1));
-                        SendInput(1, &in, sizeof(INPUT));
-                    } else if (typ == "click" || typ == "mousedown" || typ == "mouseup" || typ == "dblclick") {
-                        int btn = data.value("button", 0);
-                        INPUT in[2] = {};
-                        if (btn == 0) { // left
-                            if (typ == "mousedown") {
-                                in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-                                SendInput(1, &in[0], sizeof(INPUT));
-                            } else if (typ == "mouseup") {
-                                in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-                                SendInput(1, &in[0], sizeof(INPUT));
-                            } else if (typ == "click") {
-                                in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-                                in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-                                SendInput(2, in, sizeof(INPUT));
-                            } else if (typ == "dblclick") {
-                                in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-                                in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-                                SendInput(2, in, sizeof(INPUT));
-                                Sleep(40);
-                                SendInput(2, in, sizeof(INPUT));
-                            }
-                        } else if (btn == 2) { // right
-                            if (typ == "click") {
-                                in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
-                                in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
-                                SendInput(2, in, sizeof(INPUT));
-                            }
-                        }
-                    } else if (typ == "wheel") {
-                        int deltaY = data.value("deltaY", 0);
-                        INPUT in = {};
-                        in.type = INPUT_MOUSE;
-                        in.mi.dwFlags = MOUSEEVENTF_WHEEL;
-                        in.mi.mouseData = (DWORD)deltaY;
-                        SendInput(1, &in, sizeof(INPUT));
-                    } else if (typ == "keydown" || typ == "keyup") {
-                        std::string key = data.value("key", "");
-                        // simple mapping for common keys (letters/digits/enter/esc)
-                        SHORT vk = VkKeyScanA(key.size() ? key[0] : 0) & 0xff;
-                        if (vk) {
-                            INPUT in = {};
-                            in.type = INPUT_KEYBOARD;
-                            in.ki.wVk = vk;
-                            if (typ == "keyup") in.ki.dwFlags = KEYEVENTF_KEYUP;
-                            SendInput(1, &in, sizeof(INPUT));
-                        }
-                    }
-                }
-            } catch (std::exception& ex) {
-                std::cout << "JSON parse error: " << ex.what() << "\n";
+        if (vk != 0) {
+            INPUT input = {0};
+            input.type = INPUT_KEYBOARD;
+            
+            // Map character keys to Virtual Key codes
+            if (vk >= '0' && vk <= '9' || vk >= 'A' && vk <= 'Z') {
+                input.ki.wVk = 0; // wVk should be 0 for standard characters to use wScan
+                input.ki.wScan = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
+                input.ki.dwFlags = KEYEVENTF_SCANCODE;
+            } else {
+                input.ki.wVk = vk; // Use wVk for special/function keys
             }
-        } else {
-            // other socket.io messages
-        }
-    } else {
-        // other engine.io frames
-    }
-}
-
-// Reader thread: receive websocket messages
-void recvLoop() {
-    const DWORD buffSize = 8192;
-    std::vector<char> buffer(buffSize);
-    while (keepRunning) {
-        DWORD length = 0;
-        DWORD flags = 0;
-        BOOL res = FALSE;
-        {
-            std::lock_guard<std::mutex> lk(sockMutex);
-            if (!hWebSocket) break;
-            res = WinHttpWebSocketReceive(hWebSocket, (LPVOID)buffer.data(), (DWORD)buffer.size(), &length, &flags);
-        }
-        if (!res) {
-            DWORD err = GetLastError();
-            std::cout << "WebSocket receive failed: " << err << "\n";
-            break;
-        }
-        if (length == 0 && flags == WINHTTP_WEB_SOCKET_CLOSE_FLAG) {
-            std::cout << "WebSocket closed by server\n";
-            break;
-        }
-        if (flags & WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE) {
-            std::string msg(buffer.data(), buffer.data() + length);
-            handleTextMessage(msg);
-        } else if (flags & WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
-            // binary message - in our design, binary frames correspond to attachments or ping - ignore
-            // we don't expect server->binary except if server forwards something binary (unlikely)
-            // optionally print size
-            std::cout << "[binary message] size=" << length << "\n";
-        }
-    }
-}
-
-// Main connect routine (engine.io websocket)
-bool connectSocketIO() {
-    std::wstring host, path;
-    INTERNET_PORT port = 0; bool secure = true;
-    if (!parseUrl(configServer, host, path, port, secure)) {
-        std::cout << "Invalid server URL in config\n";
-        return false;
-    }
-    // append socket.io query params
-    std::wstring fullPath = path + L"/socket.io/?EIO=4&transport=websocket";
-    URL_COMPONENTS uc = {};
-    uc.dwStructSize = sizeof(uc);
-    uc.lpszHostName = (LPWSTR)host.c_str();
-    uc.dwHostNameLength = (DWORD)host.size();
-    const wchar_t* userAgent = L"AgentClient/1.0";
-
-    hSession = WinHttpOpen(userAgent, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) { std::cout << "WinHttpOpen failed\n"; return false; }
-
-    hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
-    if (!hConnect) { std::cout << "WinHttpConnect failed\n"; return false; }
-
-    hRequest = WinHttpOpenRequest(hConnect, L"GET", fullPath.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0);
-    if (!hRequest) { std::cout << "WinHttpOpenRequest failed\n"; return false; }
-
-    // upgrade to websocket
-    BOOL ok = WinHttpWebSocketCompleteUpgrade(hRequest, NULL);
-    if (!ok) {
-        // In practice, you must call WinHttpSendRequest/ReceiveResponse before CompleteUpgrade
-        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-            std::cout << "WinHttpSendRequest failed\n"; return false;
-        }
-        if (!WinHttpReceiveResponse(hRequest, NULL)) {
-            std::cout << "WinHttpReceiveResponse failed\n"; return false;
-        }
-        hWebSocket = WinHttpWebSocketCompleteUpgrade(hRequest, NULL);
-        if (!hWebSocket) { std::cout << "WinHttpWebSocketCompleteUpgrade failed\n"; return false; }
-    } else {
-        // rarely used path
-        hWebSocket = WinHttpWebSocketCompleteUpgrade(hRequest, NULL);
-        if (!hWebSocket) { std::cout << "WinHttpWebSocketCompleteUpgrade failed (2)\n"; return false; }
-    }
-
-    std::cout << "WebSocket connected\n";
-    return true;
-}
-
-int wmain(int argc, wchar_t* argv[]) {
-    // init GDI+
-    ULONG_PTR gdiplusToken;
-    GdiplusStartupInput gdiplusStartupInput;
-    GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
-
-    loadConfig();
-    std::cout << "Server: " << configServer << "\nRoom: " << configRoom << "\nName: " << configName << "\nFPS: " << configFps << "\n";
-
-    if (!connectSocketIO()) {
-        std::cout << "Failed to connect to server\n";
-        return 1;
-    }
-
-    // start receiver thread
-    std::thread recvThread(recvLoop);
-
-    // Main loop: capture & send frames when granted
-    while (keepRunning) {
-        if (granted) {
-            int w=0,h=0;
-            auto img = captureScreenJpeg(w,h, 55);
-            if (!img.empty()) {
-                // send via socket.io binary mechanism
-                if (!sendFrameAsSocketIOBinary(img)) {
-                    std::cout << "Failed to send frame\n";
-                    // continue but maybe break
-                } else {
-                    std::cout << "Sent frame size=" << img.size() << " " << w << "x" << h << "\n";
-                }
+            
+            if (state_str == "up") {
+                input.ki.dwFlags |= KEYEVENTF_KEYUP; // Set flag for key release
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000 / max(1, configFps)));
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            // else: dwFlags remains default for key down
+
+            SendInput(1, &input, sizeof(INPUT));
         }
     }
+}
 
-    // cleanup
-    if (hWebSocket) {
-        WinHttpWebSocketClose(hWebSocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
-        WinHttpCloseHandle(hWebSocket);
-    }
-    if (hRequest) WinHttpCloseHandle(hRequest);
-    if (hConnect) WinHttpCloseHandle(hConnect);
-    if (hSession) WinHttpCloseHandle(hSession);
 
-    GdiplusShutdown(gdiplusToken);
-    if (recvThread.joinable()) recvThread.join();
-    return 0;
+void streamThread() {
+	std::vector<BYTE> buffer;
+	while (running) {
+		captureJPEG(buffer);
+		if (!buffer.empty()) {
+			ws_send(buffer);
+		}
+		Sleep(33); // ~30 FPS
+	}
+}
+// --------------------------------------------------------
+
+// ======================================
+// 🛠️ LISTEN THREAD WITH DEFRAMING
+// ======================================
+void listenThread() {
+	char buf[4096];
+	while (running) {
+		int len = recv(ws, buf, 4096, 0);
+		if (len <= 0) break;
+
+		// Basic WebSocket Deframing Logic (Server->Client: Mask=0)
+
+		// 1. First Byte: Check Opcode (expect Text = 0x01)
+		int opcode = buf[0] & 0x0F;
+		if (opcode != 0x01 && opcode != 0x08) continue; // 0x01=Text, 0x08=Close
+
+		if (opcode == 0x08) { // Close frame received
+			running = false;
+			break;
+		}
+
+		// 2. Second Byte: Get Payload Length (assuming len < 126)
+		size_t payload_len = buf[1] & 0x7F;
+
+		if (payload_len > len - 2) continue; // Not enough data in buffer (incomplete frame)
+		
+		// 3. Extract payload (Payload starts at buf[2] for small frames)
+		std::string msg(buf + 2, payload_len);
+		
+		handleControl(msg);
+	}
+	running = false;
+}
+
+
+// ======================================
+// 🛠️ MAIN FUNCTION
+// ======================================
+int main() {
+	// 1. Init GDI+ 
+	GdiplusStartupInput gdiplusStartupInput;
+	GdiplusStartup(&token, &gdiplusStartupInput, NULL);
+
+	// Screen size
+	screenW = GetSystemMetrics(SM_CXSCREEN);
+	screenH = GetSystemMetrics(SM_CYSCREEN);
+
+	// 2. Setup Winsock and Connection
+	WSADATA wsa;
+	WSAStartup(MAKEWORD(2, 2), &wsa);
+
+	ws = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+	sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(SERVER_PORT); 
+	inet_pton(AF_INET, ip.c_str(), &addr.sin_addr); 
+
+	if (connect(ws, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+		MessageBoxA(0, ("Failed to connect to server: " + ip + ":" + std::to_string(SERVER_PORT)).c_str(), "Error", 0);
+		closesocket(ws);
+		WSACleanup();
+		GdiplusShutdown(token);
+		return 0;
+	}
+
+	// 3. Send WebSocket Handshake
+	std::string header = 
+		"GET /agent?room=" + room + " HTTP/1.1\r\n"
+		"Host: " + ip + ":" + std::to_string(SERVER_PORT) + "\r\n"
+		"Upgrade: websocket\r\n"
+		"Connection: Upgrade\r\n"
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" 
+		"Sec-WebSocket-Version: 13\r\n\r\n";
+	
+	send(ws, header.c_str(), header.size(), 0);
+
+	// 4. Check Handshake Response 
+	char response_buf[2048];
+	int bytes_received = recv(ws, response_buf, sizeof(response_buf) - 1, 0);
+	
+	if (bytes_received <= 0) {
+		MessageBoxA(0, "Did not receive handshake response from server.", "Error", 0);
+		closesocket(ws);
+		WSACleanup();
+		GdiplusShutdown(token);
+		return 0;
+	}
+	
+	response_buf[bytes_received] = '\0'; 
+
+	std::string response(response_buf);
+
+	if (response.find("101 Switching Protocols") == std::string::npos) {
+		MessageBoxA(0, "WebSocket Handshake Failed (Server did not accept protocol switch).", "Error", 0);
+		closesocket(ws);
+		WSACleanup();
+		GdiplusShutdown(token);
+		return 0;
+	}
+	
+	// 5. Start Threads
+	std::thread t1(listenThread);
+	std::thread t2(streamThread);
+
+	t1.join();
+	t2.join();
+
+	// 6. Cleanup
+	closesocket(ws);
+	WSACleanup();
+	GdiplusShutdown(token);
+	return 0;
 }

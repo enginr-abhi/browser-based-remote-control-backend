@@ -1,171 +1,165 @@
-const http = require('http');
+const http = require("http");
 const express = require("express");
 const { Server } = require("socket.io");
-const cors = require("cors");
-const path = require('path');
-const fs = require('fs');
+const WebSocket = require("ws");
+const path = require("path");
+const fs = require("fs");
 const PORT = process.env.PORT || 9000;
 
 const app = express();
-const server = http.createServer(app);
 
-app.use(cors());
+// --- NEW GLOBAL MAP FOR TARGETING ---
+// Key: Agent's Room ID (User 2 ka room) -> Value: Viewer's Socket ID (User 1 ka ID)
+let viewerMap = new Map(); 
 
+// ✅ FIX 1: Frontend serving start hone ke baad / route ko index.html par redirect karna zaroori hai.
 app.get("/", (req, res) => {
-  res.send("Backend is LIVE ✅, version: 5 (dynamic agent room)");
+    res.send("Backend is LIVE ✅, version: 5 (dynamic agent room)");
 });
 
-// ✅ Dynamic agent download (with room info)
+// --- DOWNLOAD ROUTE ---
 app.get("/download-agent", (req, res) => {
-  const roomId = req.query.room || "room1";
-  const agentDir = path.join(__dirname, "agent");
+    // 1. Path is confirmed: __dirname (backend) + 'agent' folder + 'agent.exe'
+    const agentFilePath = path.join(__dirname, "agent", "agent.exe");
 
-  // Write config.json dynamically for the agent
-  try {
-    const configPath = path.join(agentDir, "config.json");
-    fs.writeFileSync(configPath, JSON.stringify({ roomId }, null, 2));
-    console.log(`📝 Created config.json for room: ${roomId}`);
-  } catch (err) {
-    console.error("⚠️ Failed to write config.json:", err);
-  }
+    // 2. CHECK: Log the final path the server sees
+    console.log(`[DOWNLOAD] Checking path: ${agentFilePath}`);
 
-  const filePath = path.join(agentDir, "agent.exe");
-  res.download(filePath, "remote-agent.exe", err => {
-    if (err) {
-      console.error("Download error:", err);
-      res.status(500).send("File not found");
+    // 3. CHECK: Manually verify if the file exists before sending
+    if (!fs.existsSync(agentFilePath)) {
+        console.error(`[DOWNLOAD ERROR] File NOT FOUND at: ${agentFilePath}`);
+        return res
+            .status(404)
+            .send(
+                "File not available on site. Please ensure agent.exe is compiled and located in the /backend/agent/ folder."
+            );
     }
-  });
+    
+    // 4. Send the file with the correct name "RemoteAgent.exe"
+    res.download(agentFilePath, "RemoteAgent.exe", (err) => {
+        if (err) {
+            // FIX 3: Agar download fail hota hai, to permission ya lock issue hota hai. 
+            // 404 status galat hai. Bas error log karna kafi hai.
+            console.error("[DOWNLOAD ERROR] Failed to send file (Permission/Lock):", err.message);
+        } else {
+            console.log("[DOWNLOAD] File sent successfully.");
+        }
+    });
 });
 
-const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
+const server = http.createServer(app);
+const io = new Server(server, { 
+    cors: {  
+      origin: "*" , 
+      methods: ["GET", "POST"]
+    }
 });
 
-const peers = {}; // socketId -> { name, roomId, isAgent, isSharing, captureInfo? }
-const users = {}; // socketId -> { id, name, room, isOnline }
+// Raw WebSocket server (FOR AGENT)
+const wss = new WebSocket.Server({ noServer: true });
 
-// Helper: broadcast full user list to everyone
-function broadcastUserList() {
-  const userList = Object.entries(users).map(([id, u]) => ({
-    id,
-    name: u.name || "Unknown",
-    roomId: u.room || "N/A",
-    isOnline: !!u.isOnline
-  }));
-  io.emit("peer-list", userList);
+let agents = new Map(); // roomId → agentSocket
+
+// Handle WS upgrade
+server.on("upgrade", (req, socket, head) => {
+    if (req.url.startsWith("/agent")) {
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit("connection", ws, req);
+        });
+    }
+});
+
+// AGENT CONNECT
+wss.on("connection", (ws, req) => {
+    let roomId = new URL(req.url, `http://${req.headers.host}`).searchParams.get(
+        "room"
+    );
+    console.log("Agent joined room:", roomId);
+
+    agents.set(roomId, ws);
+
+    ws.on("message", (msg) => {
+        // 🛑 FIX: Room mein broadcast karne ke bajaye, sirf Viewer ko bhej rahe hain.
+        let viewerSocketId = viewerMap.get(roomId); 
+        
+        if (viewerSocketId) {
+            io.to(viewerSocketId).emit("agent-frame", msg);
+        }
+    });
+
+    ws.on("close", () => {
+        agents.delete(roomId);
+        viewerMap.delete(roomId); // Connection close hone par map se bhi hata do
+    });
+});
+
+// ✅ FIX 2: EXPRESS STATIC (CRITICAL! Uncomment aur path fix kiya)
+// Frontend files (/frontend) parent directory (..) mein hain.
+// app.use(express.static(path.join(__dirname, '..', 'frontend')));
+
+// SOCKET.IO (browser)
+io.on("connection", (socket) => {
+    console.log("User connected:", socket.id);
+
+    socket.on("join", ({ name, room }) => {
+        socket.join(room);
+        socket.data.name = name;
+        socket.data.room = room;
+
+        io.to(room).emit("user-list", getUsers(room));
+    });
+
+    socket.on("request-access", ({ target }) => {
+        io.to(target).emit("incoming-request", {
+            from: socket.id,
+            name: socket.data.name,
+        });
+    });
+
+    socket.on("accept-request", ({ from }) => {
+        io.to(from).emit("request-accepted", { ok: true });
+        
+        // 🎯 FIX: Viewer (request bhejnewala) ki ID store karo
+        // from = Viewer (User 1) ka socket ID
+        // socket.data.room = Agent (User 2) ka room ID
+        viewerMap.set(socket.data.room, from); 
+    });
+
+    // socket.on("control", (data) => {
+    //     // forward the control object directly to agent (so agent receives {"type":"mouse", ...})
+    //     let agent = agents.get(socket.data.room);
+    //     if (agent) agent.send(JSON.stringify({ type: "control", data }));
+    // });
+    socket.on("control", (data) => {
+    // forward the control object directly to agent (so agent receives {"type":"mouse", ...})
+    const agent = agents.get(socket.data.room);
+    if (!agent) return;
+    // agent is a WebSocket (ws from wss.on('connection'))
+    try {
+        agent.send(JSON.stringify(data));
+    } catch (err) {
+        console.error("Failed to forward control to agent:", err.message);
+    }
+});
+
+    socket.on("disconnect", () => {
+        io.to(socket.data.room).emit("user-list", getUsers(socket.data.room));
+    });
+});
+
+function getUsers(room) {
+    let users = [];
+    let list = io.sockets.adapter.rooms.get(room);
+    if (!list) return [];
+
+    list.forEach((id) => {
+        let s = io.sockets.sockets.get(id);
+        if (s?.data?.name) users.push({ id, name: s.data.name });
+    });
+
+    return users;
 }
 
-io.on("connection", socket => {
-  console.log("Connected:", socket.id);
-
-  // set-name: store name, mark online
-  socket.on("set-name", ({ name }) => {
-    peers[socket.id] = { ...peers[socket.id], name };
-    users[socket.id] = { id: socket.id, name, room: peers[socket.id]?.roomId || null, isOnline: true };
-    io.emit("update-users", Object.values(users));
-    broadcastUserList();
-  });
-
-  // join-room: put socket in room, mark user online and in room
-  socket.on("join-room", ({ roomId, name, isAgent = false }) => {
-    peers[socket.id] = { ...peers[socket.id], name, roomId, isAgent, isSharing: false };
-    socket.join(roomId);
-    users[socket.id] = { id: socket.id, name: name || peers[socket.id]?.name || "Unknown", room: roomId, isOnline: true };
-
-    socket.to(roomId).emit("peer-joined", { id: socket.id, name: peers[socket.id].name, isAgent });
-    io.emit("update-users", Object.values(users));
-    broadcastUserList();
-
-    console.log(`👤 ${name || 'Unknown'} joined room: ${roomId} (Agent: ${isAgent})`);
-  });
-
-  // Client requests the latest peers
-  socket.on("get-peers", () => broadcastUserList());
-
-  // leave-room: user voluntarily leaves the room (stays connected)
-  socket.on("leave-room", ({ roomId, name }) => {
-    const actualRoom = roomId || (peers[socket.id] && peers[socket.id].roomId);
-    if (actualRoom) {
-      // make socket leave the room
-      try { socket.leave(actualRoom); } catch (e) { /* ignore */ }
-
-      // update server state
-      if (peers[socket.id]) {
-        peers[socket.id].roomId = null;
-      }
-      if (users[socket.id]) {
-        users[socket.id].room = null;
-        // mark offline for presence dot (you wanted offline presence after leaving)
-        users[socket.id].isOnline = false;
-      }
-
-      // notify the room that the peer left
-      socket.to(actualRoom).emit("peer-left", { id: socket.id, name: name || peers[socket.id]?.name });
-
-      // broadcast updated user list to everyone
-      io.emit("update-users", Object.values(users));
-      broadcastUserList();
-
-      console.log(`🚪 ${name || peers[socket.id]?.name || socket.id} left room: ${actualRoom}`);
-    }
-  });
-
-  // disconnect: remove peer and mark offline / clean up
-  socket.on("disconnect", () => {
-    const { roomId, isSharing } = peers[socket.id] || {};
-    // Remove server-side records for the socket
-    delete peers[socket.id];
-    delete users[socket.id];
-
-    io.emit("update-users", Object.values(users));
-    broadcastUserList();
-
-    if (roomId) {
-      socket.to(roomId).emit("peer-left", { id: socket.id });
-      if (isSharing) socket.to(roomId).emit("stop-share");
-    }
-    console.log(`❌ Disconnected: ${socket.id}`);
-  });
-
-  // ---- Screen request & permission ----
-  socket.on("request-screen", ({ roomId, from }) => {
-    socket.to(roomId).emit("screen-request", { from, name: peers[socket.id]?.name });
-  });
-
-  socket.on("permission-response", ({ to, accepted }) => {
-    if (accepted && peers[socket.id]) peers[socket.id].isSharing = true;
-    io.to(to).emit("permission-result", accepted);
-  });
-
-  socket.on("stop-share", ({ roomId, name }) => {
-    if (peers[socket.id]) peers[socket.id].isSharing = false;
-    io.in(roomId).emit("stop-share", { name });
-  });
-
-  // ---- WebRTC signaling ----
-  socket.on("signal", ({ roomId, desc, candidate }) => {
-    socket.to(roomId).emit("signal", { desc, candidate });
-  });
-
-  // ---- Capture info (resolution & scaling) ----
-  socket.on("capture-info", info => {
-    peers[socket.id] = { ...peers[socket.id], captureInfo: info, roomId: info.roomId };
-    for (const [id, p] of Object.entries(peers)) {
-      if (p.roomId === info.roomId && p.isAgent) io.to(id).emit("capture-info", info);
-    }
-  });
-
-  // ---- Remote control events ----
-  socket.on("control", data => {
-    const { roomId } = peers[socket.id] || {};
-    if (!roomId) return;
-    for (const [id, p] of Object.entries(peers)) {
-      if (p.roomId === roomId && p.isAgent) io.to(id).emit("control", data);
-    }
-  });
-});
-
-server.listen(PORT, '0.0.0.0',() => {
-  console.log(`Server running on http://0.0.0.0:${PORT}`);
-});
+server.listen(PORT, '0.0.0.0', () =>
+    console.log(`Server running on port http://0.0.0.0:${PORT}`)
+);

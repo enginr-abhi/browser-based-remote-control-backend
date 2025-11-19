@@ -1,5 +1,4 @@
 {
-  "server": "http://localhost:9000",
-  "room": "room1",
-  "autoReconnect": true
+    "roomId": "room1",
+    "serverIp": "127.0.0.1" 
 }
