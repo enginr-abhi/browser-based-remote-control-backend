@@ -50,7 +50,7 @@ app.get("/download-agent", (req, res) => {
 const server = http.createServer(app);
 const io = new Server(server, { 
     cors: {  
-      origin: "*" , 
+      origin: "https://browser-based-remote-control-fronte.vercel.app/" , 
       methods: ["GET", "POST"]
     }
 });
