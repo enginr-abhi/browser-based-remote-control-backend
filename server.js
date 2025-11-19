@@ -50,7 +50,7 @@ app.get("/download-agent", (req, res) => {
 const server = http.createServer(app);
 const io = new Server(server, { 
     cors: {  
-      origin: "https://browser-based-remote-control-fronte.vercel.app/" , 
+      origin: "https://browser-based-remote-control-fronte.vercel.app" , 
       methods: ["GET", "POST"]
     }
 });
@@ -102,6 +102,7 @@ io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
     socket.on("join", ({ name, room }) => {
+        console.log(`socket ${socket.id} joining room ${room} name ${name}`);
         socket.join(room);
         socket.data.name = name;
         socket.data.room = room;
