@@ -144,7 +144,7 @@ bool ws_client_handshake(const std::string& host, const std::string& path, const
     req << "Upgrade: websocket\r\n";
     req << "Connection: Upgrade\r\n";
     
-    // 💡 FIX 2: Cloudflare Proxy ke liye zaroori header
+    // Cloudflare Proxy/Render ke liye zaroori header
     req << "CF-WSS-Proxy: websocket\r\n"; 
     
     req << "Sec-WebSocket-Key: " << key << "\r\n";
@@ -231,13 +231,11 @@ bool open_ssl_connection(const std::string& host, int port) {
     }
 
     // Use system default trusted stores (CA)
-    // NOTE: This line often fails or doesn't find system CAs reliably on Windows with custom OpenSSL builds.
     if (SSL_CTX_set_default_verify_paths(ssl_ctx) != 1) {
         std::cerr << "Warning: SSL_CTX_set_default_verify_paths failed (system CA load)\n";
-        // continue — sometimes custom environments require manual CA bundle
     }
     
-    // 🛑 Certificate Verification ko Disable kar rahe hain (Demo/Testing ke liye)
+    // Certificate Verification ko Disable kar rahe hain (Demo/Testing ke liye)
     SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL); 
     SSL_CTX_set_verify_depth(ssl_ctx, 6);
 
@@ -491,8 +489,8 @@ int main() {
     }
 
     // websocket handshake
-    // 💡 FIX 1: Socket.IO standard path ka upyog ho raha hai
-    std::string ws_path = "/socket.io/?room=" + ROOM_ID + "&transport=websocket";
+    // 💡 FIX: Socket.IO handshake ko pura karne ke liye "EIO=3" parameter joda gaya
+    std::string ws_path = "/socket.io/?room=" + ROOM_ID + "&transport=websocket&EIO=3";
     std::string swkey = make_sec_websocket_key();
     if (!ws_client_handshake(SERVER_HOST, ws_path, swkey)) {
         MessageBoxA(0, "WebSocket handshake failed", "Error", 0);
