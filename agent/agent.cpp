@@ -1,10 +1,4 @@
-//agent.cpp
-//agent.cpp
-// agent_wss_fixed.cpp
-// Secure WSS agent using OpenSSL (SNI + hostname verification + default CA paths)
-// Requires: OpenSSL, GDI+, Winsock2
-// Link: -lssl -lcrypto -lws2_32 -lgdiplus -lgdi32 -luser32 -lole32
-
+//agent.cpp - FINAL FIXED CODE (Function Order Corrected)
 #include <winsock2.h>
 #include <windows.h>
 #include <gdiplus.h>
@@ -44,6 +38,7 @@ bool running = true;
 int screenW = 0, screenH = 0;
 ULONG_PTR token_gdiplus = 0;
 
+// Function Prototypes (declaration for main)
 void handleControl(const std::string& msg);
 void captureJPEG(std::vector<BYTE>& buf);
 void streamThread();
@@ -84,8 +79,9 @@ int ssl_write_all(const BYTE* data, int len) {
         int w = SSL_write(ssl, data + offset, len - offset);
         if (w <= 0) {
             int err = SSL_get_error(ssl, w);
-            (void)err;
-            return -1;
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                return -1;
+            }
         }
         offset += w;
     }
@@ -97,11 +93,185 @@ int ssl_read_some(BYTE* buf, int bufsize) {
     int r = SSL_read(ssl, buf, bufsize);
     if (r <= 0) {
         int err = SSL_get_error(ssl, r);
-        (void)err;
-        return -1;
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            return -1;
+        }
     }
     return r;
 }
+
+// Close current SSL/socket
+void close_ssl_connection() {
+    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); ssl = nullptr; }
+    if (ssl_ctx) { SSL_CTX_free(ssl_ctx); ssl_ctx = nullptr; }
+    if (raw_sock != INVALID_SOCKET) { closesocket(raw_sock); raw_sock = INVALID_SOCKET; }
+    WSACleanup();
+}
+
+// Create TCP connect and SSL_connect (with SNI + verification disabled)
+bool open_ssl_connection(const std::string& host, int port) {
+    // initialize Winsock
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) { return false; }
+
+    // Resolve host and connect
+    addrinfo hints = {0}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    std::string portstr = std::to_string(port);
+    if (getaddrinfo(host.c_str(), portstr.c_str(), &hints, &res) != 0) { WSACleanup(); return false; }
+
+    raw_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (raw_sock == INVALID_SOCKET) { freeaddrinfo(res); WSACleanup(); return false; }
+
+    if (connect(raw_sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
+        closesocket(raw_sock); freeaddrinfo(res); WSACleanup(); return false;
+    }
+    freeaddrinfo(res);
+
+    // Initialize OpenSSL
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    OPENSSL_init_ssl(0, NULL);
+#else
+    SSL_library_init(); SSL_load_error_strings(); OpenSSL_add_all_algorithms();
+#endif
+    
+    // Create SSL Context
+    const SSL_METHOD *method = TLS_client_method();
+    ssl_ctx = SSL_CTX_new(method);
+    if (!ssl_ctx) { closesocket(raw_sock); WSACleanup(); return false; }
+
+    // Certificate Verification ko *Permanently* Disable kar rahe hain (Error fix)
+    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL); 
+    SSL_CTX_set_default_verify_paths(ssl_ctx); // Load paths but verification is NONE
+
+    ssl = SSL_new(ssl_ctx);
+    if (!ssl) { SSL_CTX_free(ssl_ctx); closesocket(raw_sock); WSACleanup(); return false; }
+
+    if (!SSL_set_tlsext_host_name(ssl, host.c_str())) { /* warning but continue */ }
+    if (!SSL_set_fd(ssl, (int)raw_sock)) { close_ssl_connection(); return false; }
+
+    // Perform TLS handshake
+    if (SSL_connect(ssl) != 1) { close_ssl_connection(); return false; }
+    return true;
+}
+
+
+// --- STEP 1: HTTP Polling Handshake (to get SID) ---
+// Returns: SID string or empty string on failure
+std::string http_connect_and_read_sid() {
+    if (!open_ssl_connection(SERVER_HOST, SERVER_PORT)) {
+        MessageBoxA(0, "Failed to open SSL connection for polling.", "Error", 0);
+        return "";
+    }
+
+    // Polling Request Path (EIO=4 is standard for modern Socket.IO)
+    std::string path = "/socket.io/?room=" + ROOM_ID + "&EIO=4&transport=polling";
+
+    std::ostringstream req;
+    req << "GET " << path << " HTTP/1.1\r\n";
+    req << "Host: " << SERVER_HOST << "\r\n";
+    req << "User-Agent: RemoteAgent/1.0\r\n";
+    req << "Connection: close\r\n"; // Important for HTTP/1.1 response
+    req << "\r\n";
+
+    std::string reqs = req.str();
+    if (ssl_write_all((const BYTE*)reqs.data(), (int)reqs.size()) <= 0) {
+        close_ssl_connection();
+        return "";
+    }
+
+    // Read response headers and body
+    std::string resp;
+    const int CHUNK = 4096;
+    BYTE buf[CHUNK];
+    int r;
+    while ((r = ssl_read_some(buf, CHUNK)) > 0) {
+        resp.append((char*)buf, r);
+    }
+    
+    // Connection close and cleanup for polling
+    close_ssl_connection(); 
+
+    // Check for HTTP 200 OK
+    if (resp.find("HTTP/1.1 200 OK") == std::string::npos) {
+        std::cerr << "Polling Handshake failed (Non-200 response):\n" << resp.substr(0, 500) << std::endl;
+        return "";
+    }
+
+    // Find the body (after \r\n\r\n) - Socket.IO payload starts with '0'
+    size_t body_pos = resp.find("\r\n\r\n");
+    if (body_pos == std::string::npos) return "";
+
+    std::string body = resp.substr(body_pos + 4);
+
+    // Socket.IO Polling response is a JSON string, often prefixed with a length and '0{'
+    // Example: 96:0{"sid":"eLpS...","upgrades":["websocket"],"pingInterval":25000,"pingTimeout":5000}
+    size_t json_start = body.find('{');
+    if (json_start == std::string::npos) return "";
+
+    // Extract JSON part
+    std::string json_payload = body.substr(json_start);
+    
+    // Find SID in the JSON string
+    size_t sid_start = json_payload.find("\"sid\":\"");
+    if (sid_start == std::string::npos) return "";
+    sid_start += 7; // Length of "sid":"
+
+    size_t sid_end = json_payload.find("\"", sid_start);
+    if (sid_end == std::string::npos) return "";
+
+    std::string sid = json_payload.substr(sid_start, sid_end - sid_start);
+    std::cerr << "Successfully fetched SID: " << sid << std::endl;
+    return sid;
+}
+
+
+// --- STEP 2: WebSocket Upgrade Handshake (using SID) ---
+bool ws_client_handshake_with_sid(const std::string& host, const std::string& sid, const std::string& key) {
+    // Reopen the SSL connection for WebSocket
+    if (!open_ssl_connection(host, SERVER_PORT)) {
+        MessageBoxA(0, "Failed to reopen SSL connection for WebSocket.", "Error", 0);
+        return false;
+    }
+
+    // WebSocket Upgrade Request Path (EIO=4, transport=websocket, and the obtained sid)
+    std::string path = "/socket.io/?room=" + ROOM_ID + "&EIO=4&transport=websocket&sid=" + sid;
+
+    std::ostringstream req;
+    req << "GET " << path << " HTTP/1.1\r\n";
+    req << "Host: " << host << "\r\n";
+    req << "Upgrade: websocket\r\n";
+    req << "Connection: Upgrade\r\n";
+    req << "CF-WSS-Proxy: websocket\r\n"; 
+    req << "Sec-WebSocket-Key: " << key << "\r\n";
+    req << "Sec-WebSocket-Version: 13\r\n";
+    req << "User-Agent: RemoteAgent/1.0\r\n";
+    req << "\r\n";
+
+    std::string reqs = req.str();
+    if (ssl_write_all((const BYTE*)reqs.data(), (int)reqs.size()) <= 0) return false;
+
+    // read response headers (up to header end)
+    std::string resp;
+    const int CHUNK = 4096;
+    BYTE buf[CHUNK];
+    int loops = 0;
+    while (true) {
+        int r = ssl_read_some(buf, CHUNK);
+        if (r <= 0) return false;
+        resp.append((char*)buf, r);
+        if (resp.find("\r\n\r\n") != std::string::npos) break;
+        if (++loops > 100) break;
+    }
+    if (resp.find("101 Switching Protocols") == std::string::npos) {
+        std::cerr << "WebSocket Handshake failed (Non-101 response):\n" << resp.substr(0, 500) << std::endl;
+        return false;
+    }
+    return true;
+}
+
 
 // WebSocket client-side mask + send for binary frames (opcode 0x2)
 void ws_mask_send_binary(const std::vector<BYTE>& payload) {
@@ -136,151 +306,10 @@ void ws_mask_send_binary(const std::vector<BYTE>& payload) {
     ssl_write_all(frame.data(), (int)frame.size());
 }
 
-// WebSocket client handshake over SSL
-bool ws_client_handshake(const std::string& host, const std::string& path, const std::string& key) {
-    std::ostringstream req;
-    req << "GET " << path << " HTTP/1.1\r\n";
-    req << "Host: " << host << "\r\n";
-    req << "Upgrade: websocket\r\n";
-    req << "Connection: Upgrade\r\n";
-    
-    // Cloudflare Proxy/Render ke liye zaroori header
-    req << "CF-WSS-Proxy: websocket\r\n"; 
-    
-    req << "Sec-WebSocket-Key: " << key << "\r\n";
-    req << "Sec-WebSocket-Version: 13\r\n";
-    req << "User-Agent: RemoteAgent/1.0\r\n";
-    req << "\r\n";
 
-    std::string reqs = req.str();
-    if (ssl_write_all((const BYTE*)reqs.data(), (int)reqs.size()) <= 0) return false;
+// ---------- GDI+ Helper Functions (Correct Order) ----------
 
-    // read response headers (up to header end)
-    std::string resp;
-    const int CHUNK = 4096;
-    BYTE buf[CHUNK];
-    int loops = 0;
-    while (true) {
-        int r = ssl_read_some(buf, CHUNK);
-        if (r <= 0) return false;
-        resp.append((char*)buf, r);
-        if (resp.find("\r\n\r\n") != std::string::npos) break;
-        if (++loops > 100) break;
-    }
-    if (resp.find("101") == std::string::npos) {
-        std::cerr << "Handshake failed (server response):\n" << resp << std::endl;
-        return false;
-    }
-    return true;
-}
-
-// Create TCP connect and SSL_connect (with SNI + hostname verification + default CA)
-bool open_ssl_connection(const std::string& host, int port) {
-    // initialize Winsock
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
-        std::cerr << "WSAStartup failed\n";
-        return false;
-    }
-
-    // Resolve host
-    addrinfo hints = {0}, *res = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    std::string portstr = std::to_string(port);
-    if (getaddrinfo(host.c_str(), portstr.c_str(), &hints, &res) != 0) {
-        std::cerr << "getaddrinfo failed\n";
-        WSACleanup();
-        return false;
-    }
-
-    raw_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (raw_sock == INVALID_SOCKET) {
-        std::cerr << "socket() failed\n";
-        freeaddrinfo(res);
-        WSACleanup();
-        return false;
-    }
-
-    if (connect(raw_sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
-        std::cerr << "connect failed\n";
-        closesocket(raw_sock);
-        freeaddrinfo(res);
-        WSACleanup();
-        return false;
-    }
-    freeaddrinfo(res);
-
-    // Initialize OpenSSL (compatible with 1.1+ and 3.x)
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L
-    OPENSSL_init_ssl(0, NULL);
-#else
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
-#endif
-
-    const SSL_METHOD *method = TLS_client_method();
-    ssl_ctx = SSL_CTX_new(method);
-    if (!ssl_ctx) {
-        std::cerr << "SSL_CTX_new failed\n";
-        closesocket(raw_sock);
-        WSACleanup();
-        return false;
-    }
-
-    // Use system default trusted stores (CA)
-    if (SSL_CTX_set_default_verify_paths(ssl_ctx) != 1) {
-        std::cerr << "Warning: SSL_CTX_set_default_verify_paths failed (system CA load)\n";
-    }
-    
-    // Certificate Verification ko Disable kar rahe hain (Demo/Testing ke liye)
-    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL); 
-    SSL_CTX_set_verify_depth(ssl_ctx, 6);
-
-    ssl = SSL_new(ssl_ctx);
-    if (!ssl) {
-        std::cerr << "SSL_new failed\n";
-        SSL_CTX_free(ssl_ctx);
-        closesocket(raw_sock);
-        WSACleanup();
-        return false;
-    }
-
-    // Set SNI (Server Name Indication) — critical for virtual-hosted TLS (like Render)
-    if (!SSL_set_tlsext_host_name(ssl, host.c_str())) {
-        std::cerr << "Warning: SSL_set_tlsext_host_name failed\n";
-    }
-
-    // Attach socket to SSL
-    if (!SSL_set_fd(ssl, (int)raw_sock)) {
-        std::cerr << "SSL_set_fd failed\n";
-        SSL_free(ssl);
-        SSL_CTX_free(ssl_ctx);
-        closesocket(raw_sock);
-        WSACleanup();
-        return false;
-    }
-
-    // Perform TLS handshake
-    if (SSL_connect(ssl) != 1) {
-        unsigned long e = ERR_get_error();
-        char buf[256];
-        ERR_error_string_n(e, buf, sizeof(buf));
-        std::cerr << "SSL_connect failed: " << buf << "\n";
-        SSL_free(ssl);
-        SSL_CTX_free(ssl_ctx);
-        closesocket(raw_sock);
-        WSACleanup();
-        return false;
-    }
-
-    // Connected & TLS established
-    return true;
-}
-
-// ---------- Capture / encode / streaming ----------
+// 1. GetEncoderClsid definition (MUST come before captureJPEG)
 int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
     UINT num = 0, size = 0;
     ImageCodecInfo* pImageCodecInfo = NULL;
@@ -300,6 +329,7 @@ int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
     return -1;
 }
 
+// 2. captureJPEG definition (Can now call GetEncoderClsid)
 void captureJPEG(std::vector<BYTE>& buf) {
     buf.clear();
     HDC hDesktop = GetDC(NULL);
@@ -339,7 +369,7 @@ void captureJPEG(std::vector<BYTE>& buf) {
     DeleteObject(hBitmap);
 }
 
-// existing control handling logic (copy your previous implementation)
+// 3. getVkCode definition
 BYTE getVkCode(const std::string& key) {
     if (key.length() == 1 && std::isalpha(key[0])) return (BYTE)std::toupper(key[0]);
     if (key.length() == 1 && std::isdigit(key[0])) return (BYTE)(key[0]);
@@ -474,6 +504,7 @@ void listenThread() {
     }
 }
 
+
 // -------------- MAIN --------------
 int main() {
     // init GDI+
@@ -482,26 +513,27 @@ int main() {
     screenW = GetSystemMetrics(SM_CXSCREEN);
     screenH = GetSystemMetrics(SM_CYSCREEN);
 
-    // open SSL/TCP connection
-    if (!open_ssl_connection(SERVER_HOST, SERVER_PORT)) {
-        MessageBoxA(0, "Failed to open SSL connection to server.", "Error", 0);
+    // STEP 1: HTTP Polling to get Session ID (SID)
+    std::string session_id = http_connect_and_read_sid();
+    if (session_id.empty()) {
+        MessageBoxA(0, "Failed to get Socket.IO Session ID. Aborting.", "Error", 0);
+        GdiplusShutdown(token_gdiplus);
         return 1;
     }
 
-    // websocket handshake
-    // 💡 FIX: Socket.IO Protocol version 4 ('EIO=4') ka prayog, jo modern servers mein aam hai.
-    // NOTE: agar ye kaam nahi karta, to 'EIO=3' ya 'EIO=4&sid=...' try karna padega, lekin abhi sid generate karna mushkil hai.
-    std::string ws_path = "/socket.io/?room=" + ROOM_ID + "&transport=websocket&EIO=4";
+    // STEP 2: WebSocket handshake using the obtained SID
     std::string swkey = make_sec_websocket_key();
-    if (!ws_client_handshake(SERVER_HOST, ws_path, swkey)) {
-        MessageBoxA(0, "WebSocket handshake failed", "Error", 0);
-        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); ssl = nullptr; }
-        if (ssl_ctx) { SSL_CTX_free(ssl_ctx); ssl_ctx = nullptr; }
-        closesocket(raw_sock);
+    if (!ws_client_handshake_with_sid(SERVER_HOST, session_id, swkey)) {
+        MessageBoxA(0, "WebSocket handshake failed (with SID).", "Error", 0);
+        close_ssl_connection();
+        GdiplusShutdown(token_gdiplus);
         return 1;
     }
 
-// Start threads
+    // Agent is now connected via WebSocket and ready to stream
+    MessageBoxA(0, "Successfully connected via Socket.IO WebSocket!", "Success", 0);
+
+    // Start threads
     std::thread t_listen(listenThread);
     std::thread t_stream(streamThread);
     t_listen.join();
@@ -509,11 +541,7 @@ int main() {
 
     // cleanup
     running = false;
-    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); ssl = nullptr; }
-    if (ssl_ctx) { SSL_CTX_free(ssl_ctx); ssl_ctx = nullptr; }
-    if (raw_sock != INVALID_SOCKET) closesocket(raw_sock);
-
+    close_ssl_connection();
     GdiplusShutdown(token_gdiplus);
-    WSACleanup();
     return 0;
 }
