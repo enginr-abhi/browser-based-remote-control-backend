@@ -525,7 +525,8 @@ int main() {
     }
 
     // websocket handshake
-    std::string ws_path = "/agent?room=" + ROOM_ID;
+    // --- FIX: Socket.IO standard path ka upyog ho raha hai ---
+    std::string ws_path = "/socket.io/?room=" + ROOM_ID + "&transport=websocket";
     std::string swkey = make_sec_websocket_key();
     if (!ws_client_handshake(SERVER_HOST, ws_path, swkey)) {
         MessageBoxA(0, "WebSocket handshake failed", "Error", 0);
@@ -535,7 +536,7 @@ int main() {
         return 1;
     }
 
-    // Start threads
+// Start threads
     std::thread t_listen(listenThread);
     std::thread t_stream(streamThread);
     t_listen.join();
