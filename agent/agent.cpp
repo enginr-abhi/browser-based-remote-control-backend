@@ -489,8 +489,9 @@ int main() {
     }
 
     // websocket handshake
-    // 💡 FIX: Socket.IO handshake ko pura karne ke liye "EIO=3" parameter joda gaya
-    std::string ws_path = "/socket.io/?room=" + ROOM_ID + "&transport=websocket&EIO=3";
+    // 💡 FIX: Socket.IO Protocol version 4 ('EIO=4') ka prayog, jo modern servers mein aam hai.
+    // NOTE: agar ye kaam nahi karta, to 'EIO=3' ya 'EIO=4&sid=...' try karna padega, lekin abhi sid generate karna mushkil hai.
+    std::string ws_path = "/socket.io/?room=" + ROOM_ID + "&transport=websocket&EIO=4";
     std::string swkey = make_sec_websocket_key();
     if (!ws_client_handshake(SERVER_HOST, ws_path, swkey)) {
         MessageBoxA(0, "WebSocket handshake failed", "Error", 0);
