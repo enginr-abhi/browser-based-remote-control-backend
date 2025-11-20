@@ -1,4 +1,5 @@
 //agent.cpp
+//agent.cpp
 // agent_wss_fixed.cpp
 // Secure WSS agent using OpenSSL (SNI + hostname verification + default CA paths)
 // Requires: OpenSSL, GDI+, Winsock2
@@ -142,6 +143,10 @@ bool ws_client_handshake(const std::string& host, const std::string& path, const
     req << "Host: " << host << "\r\n";
     req << "Upgrade: websocket\r\n";
     req << "Connection: Upgrade\r\n";
+    
+    // 💡 FIX 2: Cloudflare Proxy ke liye zaroori header
+    req << "CF-WSS-Proxy: websocket\r\n"; 
+    
     req << "Sec-WebSocket-Key: " << key << "\r\n";
     req << "Sec-WebSocket-Version: 13\r\n";
     req << "User-Agent: RemoteAgent/1.0\r\n";
@@ -232,8 +237,7 @@ bool open_ssl_connection(const std::string& host, int port) {
         // continue — sometimes custom environments require manual CA bundle
     }
     
-    // 🛑 FIX 1: Certificate Verification ko Disable kar rahe hain (Demo/Testing ke liye)
-    // Original: SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+    // 🛑 Certificate Verification ko Disable kar rahe hain (Demo/Testing ke liye)
     SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL); 
     SSL_CTX_set_verify_depth(ssl_ctx, 6);
 
@@ -261,16 +265,6 @@ bool open_ssl_connection(const std::string& host, int port) {
         return false;
     }
 
-    // 🛑 FIX 2: Configure hostname verification (important!) — Isko comment out kar rahe hain
-    /*
-    X509_VERIFY_PARAM *vpm = SSL_get0_param(ssl);
-    // disable partial wildcards if desired (keeps strict check)
-    X509_VERIFY_PARAM_set_hostflags(vpm, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-    if (!X509_VERIFY_PARAM_set1_host(vpm, host.c_str(), 0)) {
-        std::cerr << "Warning: X509_VERIFY_PARAM_set1_host failed\n";
-    }
-    */
-
     // Perform TLS handshake
     if (SSL_connect(ssl) != 1) {
         unsigned long e = ERR_get_error();
@@ -283,34 +277,6 @@ bool open_ssl_connection(const std::string& host, int port) {
         WSACleanup();
         return false;
     }
-
-    // 🛑 FIX 3: Post-handshake certificate check — Isko bhi comment out kar rahe hain
-    /*
-    X509* cert = SSL_get_peer_certificate(ssl);
-    if (cert) {
-        long verify = SSL_get_verify_result(ssl);
-        if (verify != X509_V_OK) {
-            std::cerr << "Certificate verification failed: " << X509_verify_cert_error_string(verify) << "\n";
-            X509_free(cert);
-            // we treat it as failure
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            SSL_CTX_free(ssl_ctx);
-            closesocket(raw_sock);
-            WSACleanup();
-            return false;
-        }
-        X509_free(cert);
-    } else {
-        std::cerr << "No server certificate presented\n";
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        SSL_CTX_free(ssl_ctx);
-        closesocket(raw_sock);
-        WSACleanup();
-        return false;
-    }
-    */
 
     // Connected & TLS established
     return true;
@@ -525,7 +491,7 @@ int main() {
     }
 
     // websocket handshake
-    // --- FIX: Socket.IO standard path ka upyog ho raha hai ---
+    // 💡 FIX 1: Socket.IO standard path ka upyog ho raha hai
     std::string ws_path = "/socket.io/?room=" + ROOM_ID + "&transport=websocket";
     std::string swkey = make_sec_websocket_key();
     if (!ws_client_handshake(SERVER_HOST, ws_path, swkey)) {
