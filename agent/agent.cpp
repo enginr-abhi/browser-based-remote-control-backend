@@ -1,5 +1,5 @@
-// agent_wss.cpp
-// Builds upon your original agent.cpp but uses OpenSSL to connect via wss://host/agent?room=ROOM_ID
+// agent_wss_fixed.cpp
+// Fixed version: SNI + TLS verification + improved logging + websocket framing
 // Requires: OpenSSL, GDI+, Winsock2
 // Link with: libssl, libcrypto, ws2_32, gdiplus
 
@@ -10,6 +10,7 @@
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509v3.h>
 
 #include <string>
 #include <thread>
@@ -86,6 +87,7 @@ int ssl_write_all(const BYTE* data, int len) {
         int w = SSL_write(ssl, data + offset, len - offset);
         if (w <= 0) {
             int err = SSL_get_error(ssl, w);
+            std::cerr << "SSL_write error: " << err << " : " << ERR_error_string(ERR_get_error(), NULL) << "\n";
             return -1;
         }
         offset += w;
@@ -98,6 +100,11 @@ int ssl_read_some(BYTE* buf, int bufsize) {
     int r = SSL_read(ssl, buf, bufsize);
     if (r <= 0) {
         int err = SSL_get_error(ssl, r);
+        if (err == SSL_ERROR_ZERO_RETURN) {
+            // clean shutdown
+            return 0;
+        }
+        std::cerr << "SSL_read error: " << err << " : " << ERR_error_string(ERR_get_error(), NULL) << "\n";
         return -1;
     }
     return r;
@@ -154,22 +161,26 @@ bool ws_client_handshake(const std::string& host, const std::string& path, const
     req << "\r\n";
 
     std::string reqs = req.str();
-    if (ssl_write_all((const BYTE*)reqs.data(), (int)reqs.size()) <= 0) return false;
+    if (ssl_write_all((const BYTE*)reqs.data(), (int)reqs.size()) <= 0) {
+        std::cerr << "Failed to send websocket handshake request\n";
+        return false;
+    }
 
     // read response headers
     std::string resp;
     const int CHUNK = 4096;
     BYTE buf[CHUNK];
-    int total = 0;
+    int totalLoops = 0;
     // read up to headers (double CRLF)
     while (true) {
         int r = ssl_read_some(buf, CHUNK);
-        if (r <= 0) return false;
+        if (r < 0) return false;
+        if (r == 0) break;
         resp.append((char*)buf, r);
         // check for header end
         if (resp.find("\r\n\r\n") != std::string::npos) break;
         // avoid infinite loop
-        if (++total > 100) break;
+        if (++totalLoops > 200) break;
     }
     // basic check for 101
     if (resp.find("101") == std::string::npos) {
@@ -188,33 +199,38 @@ bool open_ssl_connection(const std::string& host, int port) {
         return false;
     }
 
-    // resolve host
+    // resolve host (both IPv4 and IPv6 support)
     addrinfo hints = {0}, *res = nullptr;
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC; // allow v4 or v6
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
     std::string portstr = std::to_string(port);
     if (getaddrinfo(host.c_str(), portstr.c_str(), &hints, &res) != 0) {
         std::cerr << "getaddrinfo failed\n";
+        WSACleanup();
         return false;
     }
 
-    raw_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (raw_sock == INVALID_SOCKET) {
-        std::cerr << "socket() failed\n";
-        freeaddrinfo(res);
-        return false;
-    }
-
-    // connect
-    if (connect(raw_sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
-        std::cerr << "connect failed\n";
+    addrinfo *rp = res;
+    bool connected = false;
+    for (; rp != nullptr; rp = rp->ai_next) {
+        raw_sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (raw_sock == INVALID_SOCKET) continue;
+        if (connect(raw_sock, rp->ai_addr, (int)rp->ai_addrlen) == 0) {
+            connected = true;
+            break;
+        }
         closesocket(raw_sock);
-        freeaddrinfo(res);
-        return false;
+        raw_sock = INVALID_SOCKET;
     }
     freeaddrinfo(res);
+
+    if (!connected) {
+        std::cerr << "connect failed\n";
+        WSACleanup();
+        return false;
+    }
 
     // init OpenSSL
     SSL_library_init();
@@ -225,7 +241,19 @@ bool open_ssl_connection(const std::string& host, int port) {
     if (!ssl_ctx) {
         std::cerr << "SSL_CTX_new failed\n";
         closesocket(raw_sock);
+        WSACleanup();
         return false;
+    }
+
+    // Set reasonable options
+    SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION);
+
+    // Enable default verification
+    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+    // Load system default CA locations (works if OpenSSL built with system CA support)
+    if (SSL_CTX_set_default_verify_paths(ssl_ctx) != 1) {
+        std::cerr << "Warning: SSL_CTX_set_default_verify_paths failed, server cert verification may not work\n";
+        // continue (in some environments you may want to load specific CA file)
     }
 
     ssl = SSL_new(ssl_ctx);
@@ -233,6 +261,7 @@ bool open_ssl_connection(const std::string& host, int port) {
         std::cerr << "SSL_new failed\n";
         SSL_CTX_free(ssl_ctx);
         closesocket(raw_sock);
+        WSACleanup();
         return false;
     }
 
@@ -242,18 +271,74 @@ bool open_ssl_connection(const std::string& host, int port) {
         SSL_free(ssl);
         SSL_CTX_free(ssl_ctx);
         closesocket(raw_sock);
+        WSACleanup();
         return false;
     }
 
-    // perform TLS handshake
-    if (SSL_connect(ssl) != 1) {
-        std::cerr << "SSL_connect failed: " << ERR_error_string(ERR_get_error(), nullptr) << "\n";
+    // --- SNI FIX: must be set BEFORE SSL_connect ---
+    if (!SSL_set_tlsext_host_name(ssl, host.c_str())) {
+        std::cerr << "Failed to set SNI: " << ERR_error_string(ERR_get_error(), NULL) << "\n";
         SSL_free(ssl);
         SSL_CTX_free(ssl_ctx);
         closesocket(raw_sock);
+        WSACleanup();
         return false;
     }
 
+    // --- TLS Handshake ---
+    int ret = SSL_connect(ssl);
+    if (ret != 1) {
+        int err = SSL_get_error(ssl, ret);
+        unsigned long e = ERR_get_error();
+        std::cerr << "SSL_connect failed: " << ERR_error_string(e, NULL) << " | SSL_get_error=" << err << "\n";
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        closesocket(raw_sock);
+        WSACleanup();
+        return false;
+    }
+
+    // Post-handshake: verify certificate and hostname
+    X509* cert = SSL_get_peer_certificate(ssl);
+    if (!cert) {
+        std::cerr << "No peer certificate presented by server\n";
+        // treat as failure
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        closesocket(raw_sock);
+        WSACleanup();
+        return false;
+    } else {
+        // Verify the certificate chain
+        long verify_ok = SSL_get_verify_result(ssl);
+        if (verify_ok != X509_V_OK) {
+            std::cerr << "Certificate verify result: " << verify_ok << " (" << X509_verify_cert_error_string(verify_ok) << ")\n";
+            // Option: treat as failure. We'll fail here for security.
+            X509_free(cert);
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            SSL_CTX_free(ssl_ctx);
+            closesocket(raw_sock);
+            WSACleanup();
+            return false;
+        }
+
+        // Hostname check
+        if (X509_check_host(cert, host.c_str(), 0, 0, NULL) != 1) {
+            std::cerr << "Hostname verification failed for " << host << "\n";
+            X509_free(cert);
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            SSL_CTX_free(ssl_ctx);
+            closesocket(raw_sock);
+            WSACleanup();
+            return false;
+        }
+        X509_free(cert);
+    }
+
+    std::cout << "TLS handshake OK. Cipher: " << SSL_get_cipher(ssl) << "\n";
     return true;
 }
 
@@ -316,7 +401,7 @@ void captureJPEG(std::vector<BYTE>& buf) {
     DeleteObject(hBitmap);
 }
 
-// existing control handling logic (copy your previous implementation)
+// existing control handling logic (unchanged)
 BYTE getVkCode(const std::string& key) {
     if (key.length() == 1 && std::isalpha(key[0])) return (BYTE)std::toupper(key[0]);
     if (key.length() == 1 && std::isdigit(key[0])) return (BYTE)(key[0]);
@@ -500,7 +585,7 @@ int main() {
         return 1;
     }
 
-    // websocket handshake
+    // websocket handshake (path must match server)
     std::string ws_path = "/agent?room=" + ROOM_ID;
     std::string swkey = make_sec_websocket_key();
     if (!ws_client_handshake(SERVER_HOST, ws_path, swkey)) {
