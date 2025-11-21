@@ -1,4 +1,4 @@
 {
     "roomId": "room1",
-    "serverIp": "127.0.0.1" 
+    "serverIp": "https://browser-based-remote-control-backend.onrender.com" 
 }
