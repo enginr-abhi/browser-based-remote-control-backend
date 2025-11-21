@@ -1,5 +1,5 @@
-// agent_wss_fixed.cpp
-// Fixed version: SNI + TLS verification + improved logging + websocket framing
+// agent_fixed.cpp
+// Fixed: SNI + TLS verification with cacert fallback + improved logging + websocket framing
 // Requires: OpenSSL, GDI+, Winsock2
 // Link with: libssl, libcrypto, ws2_32, gdiplus
 
@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cctype>
 #include <random>
+#include <cstring>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -190,6 +191,17 @@ bool ws_client_handshake(const std::string& host, const std::string& path, const
     return true;
 }
 
+// Helper: get directory of current executable
+std::string GetExeDir() {
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, buf, MAX_PATH);
+    if (n == 0 || n == MAX_PATH) return std::string();
+    std::string s(buf, buf + n);
+    size_t pos = s.find_last_of("\\/");
+    if (pos == std::string::npos) return std::string();
+    return s.substr(0, pos);
+}
+
 // Create TCP connect and SSL_connect
 bool open_ssl_connection(const std::string& host, int port) {
     // init winsock
@@ -250,10 +262,25 @@ bool open_ssl_connection(const std::string& host, int port) {
 
     // Enable default verification
     SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
-    // Load system default CA locations (works if OpenSSL built with system CA support)
+    // Try system default CA locations first
     if (SSL_CTX_set_default_verify_paths(ssl_ctx) != 1) {
-        std::cerr << "Warning: SSL_CTX_set_default_verify_paths failed, server cert verification may not work\n";
-        // continue (in some environments you may want to load specific CA file)
+        std::cerr << "Warning: SSL_CTX_set_default_verify_paths failed\n";
+        // try to load cacert.pem from exe directory
+        std::string dir = GetExeDir();
+        if (!dir.empty()) {
+            std::string cacert = dir + "\\cacert.pem";
+            if (SSL_CTX_load_verify_locations(ssl_ctx, cacert.c_str(), NULL) == 1) {
+                std::cout << "Loaded cacert.pem from: " << cacert << "\n";
+            } else {
+                std::cerr << "Failed to load cacert.pem from exe dir. Certificate verification may fail.\n";
+                std::cerr << "*** Falling back to insecure mode: disabling certificate verification (NOT RECOMMENDED) ***\n";
+                SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
+            }
+        } else {
+            std::cerr << "Cannot determine exe dir; certificate verification may fail.\n";
+            std::cerr << "*** Falling back to insecure mode: disabling certificate verification (NOT RECOMMENDED) ***\n";
+            SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
+        }
     }
 
     ssl = SSL_new(ssl_ctx);
@@ -298,7 +325,7 @@ bool open_ssl_connection(const std::string& host, int port) {
         return false;
     }
 
-    // Post-handshake: verify certificate and hostname
+    // Post-handshake: verify certificate and hostname if verification is enabled
     X509* cert = SSL_get_peer_certificate(ssl);
     if (!cert) {
         std::cerr << "No peer certificate presented by server\n";
@@ -310,30 +337,32 @@ bool open_ssl_connection(const std::string& host, int port) {
         WSACleanup();
         return false;
     } else {
-        // Verify the certificate chain
         long verify_ok = SSL_get_verify_result(ssl);
-        if (verify_ok != X509_V_OK) {
-            std::cerr << "Certificate verify result: " << verify_ok << " (" << X509_verify_cert_error_string(verify_ok) << ")\n";
-            // Option: treat as failure. We'll fail here for security.
-            X509_free(cert);
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            SSL_CTX_free(ssl_ctx);
-            closesocket(raw_sock);
-            WSACleanup();
-            return false;
-        }
+        if (SSL_CTX_get_verify_mode(ssl_ctx) != SSL_VERIFY_NONE) {
+            if (verify_ok != X509_V_OK) {
+                std::cerr << "Certificate verify result: " << verify_ok << " (" << X509_verify_cert_error_string(verify_ok) << ")\n";
+                X509_free(cert);
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                SSL_CTX_free(ssl_ctx);
+                closesocket(raw_sock);
+                WSACleanup();
+                return false;
+            }
 
-        // Hostname check
-        if (X509_check_host(cert, host.c_str(), 0, 0, NULL) != 1) {
-            std::cerr << "Hostname verification failed for " << host << "\n";
-            X509_free(cert);
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            SSL_CTX_free(ssl_ctx);
-            closesocket(raw_sock);
-            WSACleanup();
-            return false;
+            // Hostname check
+            if (X509_check_host(cert, host.c_str(), 0, 0, NULL) != 1) {
+                std::cerr << "Hostname verification failed for " << host << "\n";
+                X509_free(cert);
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                SSL_CTX_free(ssl_ctx);
+                closesocket(raw_sock);
+                WSACleanup();
+                return false;
+            }
+        } else {
+            std::cerr << "Warning: certificate verification is disabled (insecure)\n";
         }
         X509_free(cert);
     }
