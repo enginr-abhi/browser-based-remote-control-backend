@@ -5,8 +5,8 @@ const WebSocket = require("ws");
 const path = require("path");
 const fs = require("fs");
 const PORT = process.env.PORT || 9000;
-
 const app = express();
+
 
 // --- NEW GLOBAL MAP FOR TARGETING ---
 // Key: Agent's Room ID (User 2 ka room) -> Value: Viewer's Socket ID (User 1 ka ID)
@@ -49,9 +49,10 @@ app.get("/download-agent", (req, res) => {
 
 const server = http.createServer(app);
 const io = new Server(server, { 
-    cors: {  
-      origin: "https://browser-based-remote-control-fronte.vercel.app" , 
-      methods: ["GET", "POST"]
+cors: {  
+    origin: "https://browser-based-remote-control-fronte.vercel.app", 
+      methods: ["GET", "POST"],
+      credentials: true
     }
 });
 
@@ -161,6 +162,6 @@ function getUsers(room) {
     return users;
 }
 
-server.listen(PORT, '0.0.0.0', () =>
+server.listen(PORT, "0.0.0.0" , () =>
     console.log(`Server running on port http://0.0.0.0:${PORT}`)
 );
